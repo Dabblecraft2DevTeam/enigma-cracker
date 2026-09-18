@@ -28,10 +28,22 @@ from datetime import datetime
 
 # ─── Constants ───
 
+# When bundled with PyInstaller, _MEIPASS is the temp dir where bundled
+# binaries are extracted.  In development mode it is absent and we fall
+# back to the script directory.
+if hasattr(sys, "_MEIPASS"):
+    BUNDLE_DIR = sys._MEIPASS
+else:
+    BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 C_SOURCE = os.path.join(SCRIPT_DIR, "enigma_cracker.c")
 BINARY_NAME = "enigma_cracker" if sys.platform != "win32" else "enigma_cracker.exe"
-BINARY_PATH = os.path.join(SCRIPT_DIR, BINARY_NAME)
+
+# In a PyInstaller bundle the C binary lives next to the GUI in _MEIPASS.
+# In development mode it lives in the script directory (same as before).
+BUNDLED_BINARY = os.path.join(BUNDLE_DIR, BINARY_NAME)
+BINARY_PATH = BUNDLED_BINARY
 
 
 # ─── Compiler detection ───
@@ -80,15 +92,19 @@ def compile_binary():
 
 
 def ensure_binary():
-    """Ensure the C binary exists and is up-to-date. Returns (success, message)."""
-    # Check if binary exists and is newer than source
-    if os.path.exists(BINARY_PATH):
-        bin_mtime = os.path.getmtime(BINARY_PATH)
-        src_mtime = os.path.getmtime(C_SOURCE) if os.path.exists(C_SOURCE) else 0
-        if bin_mtime >= src_mtime:
-            return True, "Binary is up-to-date"
+    """Ensure the C binary exists and is up-to-date. Returns (success, message).
 
-    # Need to compile
+    When running as a PyInstaller bundle, the pre-compiled binary is in
+    _MEIPASS and is used directly — no compiler is needed on the target
+    machine.  In development mode we fall back to compiling from source.
+    """
+    # 1. Prefer the bundled (pre-compiled) binary — always present in a
+    #    PyInstaller bundle, may also exist in the script dir in dev mode.
+    if os.path.isfile(BINARY_PATH):
+        return True, "Binary ready (bundled)"
+
+    # 2. Development fallback — compile from source if a C compiler is
+    #    available.  This path is not reached in the bundled .exe.
     return compile_binary()
 
 
@@ -582,7 +598,8 @@ class EnigmaCrackerGUI:
             "- The cracker searches rotors I-V for M3, adds beta/gamma for M4\n"
             "- If no solution is found, try the other mode\n\n"
             "Windows setup:\n"
-            "  Install MinGW-w64 (via MSYS2 recommended):\n"
+            "  Bundled .exe: no installation needed — just run it.\n"
+            "  From source: install MinGW-w64 (via MSYS2 recommended):\n"
             "  pacman -S mingw-w64-x86_64-gcc\n"
             "  Then run: python enigma_gui.py")
 
