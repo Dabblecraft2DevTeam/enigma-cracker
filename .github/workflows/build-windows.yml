@@ -1,0 +1,60 @@
+name: Build Windows GUI EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    
+    - name: Install PyInstaller
+      run: pip install pyinstaller
+    
+    - name: Build standalone EXE
+      run: |
+        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." enigma_gui.py
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: EnigmaCracker-windows
+        path: dist/EnigmaCracker.exe
+    
+    - name: Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/EnigmaCracker.exe
+        name: Enigma Cracker ${{ github.ref_name }}
+        body: |
+          ## Enigma Cracker ${{ github.ref_name }}
+          
+          ### Download
+          **EnigmaCracker.exe** — Standalone Windows GUI application
+          - No installation needed — just double-click
+          - Includes Python runtime + Tkinter GUI + C cracker backend
+          - OpenMP enabled for multi-core CPUs
+          
+          ### Usage
+          1. Download EnigmaCracker.exe
+          2. Double-click to open the GUI
+          3. Paste Enigma ciphertext into the text field
+          4. Select M3 or M4 mode
+          5. Click Crack
+          
+          ### Performance (24 threads)
+          | Mode | Configs | Time |
+          |------|---------|------|
+          | M3 | 2.1M | ~2s |
+          | M4 | 109M | ~40s |
