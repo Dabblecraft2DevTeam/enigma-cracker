@@ -440,15 +440,23 @@ static int german_word_score(const char *t, int n)
     int i = 0;
 
     while (i < n) {
-        /* Skip non-letter characters (spaces, X separators, etc.) */
+        /* Skip non-letter characters (spaces, punctuation, etc.) */
         if (t[i] < 'A' || t[i] > 'Z') {
             i++;
             continue;
         }
 
-        /* Find the end of this letter sequence */
+        /* German Enigma used X between words (e.g. ANGRIFFXVONXOSTEN).
+         * Treat X as a word delimiter so each segment is checked
+         * against the dictionary independently. */
+        if (t[i] == 'X') {
+            i++;
+            continue;
+        }
+
+        /* Find the end of this letter sequence (stop at X delimiter) */
         int start = i;
-        while (i < n && t[i] >= 'A' && t[i] <= 'Z')
+        while (i < n && t[i] >= 'A' && t[i] <= 'Z' && t[i] != 'X')
             i++;
         int seglen = i - start;
 
@@ -485,11 +493,15 @@ static int german_word_score(const char *t, int n)
     return score;
 }
 
-/* Unified scoring function: uses dictionary if loaded, else trigram fallback */
+/* Unified scoring function: combines dictionary scoring with trigram
+ * scoring.  Dictionary gives strong signal for exact word matches;
+ * trigrams give gradient signal for partial/near-matches, which is
+ * essential for plugboard hill climbing (one wrong letter shouldn't
+ * zero out the entire fitness). */
 static int german_fitness(const char *t, int n)
 {
     if (dict_loaded && dict_count > 0)
-        return german_word_score(t, n);
+        return german_word_score(t, n) + german_score(t, n);
     return german_score(t, n);
 }
 
