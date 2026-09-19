@@ -99,7 +99,7 @@ static const char *REFLECTOR_WIRE[] = {
 
 static const char *REFLECTOR_NAME[] = {"B","C","B_thin","C_thin"};
 
-enum { R_I=0, R_II, R_III, R_IV, R_V, R_VI, R_VII, R_R8, R_BETA, R_GAMMA };
+enum { R_I=0, R_II, R_III, R_IV, R_V, R_VI, R_VII, R_VIII, R_BETA, R_GAMMA };
 enum { REF_B=0, REF_C, REF_B_THIN, REF_C_THIN };
 
 /* ────────────────────────────────────────────────────────── */
@@ -739,8 +739,8 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
     memset(&result, 0, sizeof(result));
     result.is_m4 = 0;
 
-    /* Rotors to search: I–V (5 rotors → 60 permutations) */
-    int sr[5] = {R_I, R_II, R_III, R_IV, R_V};
+    /* Rotors to search: I–VIII (8 rotors → 336 permutations) */
+    int sr[8] = {R_I, R_II, R_III, R_IV, R_V, R_VI, R_VII, R_VIII};
     int sref[2] = {REF_B, REF_C};
     int idplug[26]; plug_init(idplug);
 
@@ -751,9 +751,9 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
     int ncand = 0;
     int min_ic = 0;
 
-    long long total = 60LL * 2 * 26*26*26;
+    long long total = 336LL * 2 * 26*26*26;
     if (!json_mode)
-        printf("Phase 1: %lld configs (60 rotor perms × 2 reflectors × 26³ positions, rings=AAA)\n", total);
+        printf("Phase 1: %lld configs (336 rotor perms × 2 reflectors × 26³ positions, rings=AAA)\n", total);
     fprintf(stderr, "PROGRESS:phase1:0:%lld\n", total);
     fflush(stderr);
 
@@ -761,10 +761,10 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
     long long cnt = 0;
 
     #pragma omp parallel for collapse(2) schedule(dynamic) reduction(+:cnt) shared(cand, ncand, min_ic)
-    for (int ai = 0; ai < 5; ai++)
-    for (int aj = 0; aj < 5; aj++) {
+    for (int ai = 0; ai < 8; ai++)
+    for (int aj = 0; aj < 8; aj++) {
         if (aj == ai) continue;
-        for (int ak = 0; ak < 5; ak++) {
+        for (int ak = 0; ak < 8; ak++) {
             if (ak == ai || ak == aj) continue;
             int r0 = sr[ai], r1 = sr[aj], r2 = sr[ak];
 
@@ -977,17 +977,17 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     memset(&result, 0, sizeof(result));
     result.is_m4 = 1;
 
-    int sr[5] = {R_I, R_II, R_III, R_IV, R_V};
+    int sr[8] = {R_I, R_II, R_III, R_IV, R_V, R_VI, R_VII, R_VIII};
     int sref[2] = {REF_B_THIN, REF_C_THIN};
     int thin_rotors[2] = {R_BETA, R_GAMMA};
     int idplug[26]; plug_init(idplug);
 
     int thresh = (int)(0.035 * (double)n * (n - 1));
 
-    /* Total: 2 thin × 26 thin_pos × 60 rotor_perms × 2 ref × 26³ positions */
-    long long total = 2LL * 26 * 60 * 2 * 26*26*26;
+    /* Total: 2 thin × 26 thin_pos × 336 rotor_perms × 2 ref × 26³ positions */
+    long long total = 2LL * 26 * 336 * 2 * 26*26*26;
     if (!json_mode) {
-        printf("M4 Brute-force: %lld configs (2 thin × 26 thin_pos × 60 rotor perms × 2 ref × 26³ pos)\n", total);
+        printf("M4 Brute-force: %lld configs (2 thin × 26 thin_pos × 336 rotor perms × 2 ref × 26³ pos)\n", total);
         printf("Phase 1: Searching rotor permutations and positions (rings=AAA)...\n");
     }
     fprintf(stderr, "PROGRESS:phase1:0:%lld\n", total);
@@ -1003,10 +1003,10 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     #pragma omp parallel for collapse(2) schedule(dynamic) reduction(+:cnt) shared(cand, ncand, min_ic)
     for (int thi = 0; thi < 2; thi++)
     for (int tp = 0; tp < 26; tp++) {
-        for (int ai = 0; ai < 5; ai++)
-        for (int aj = 0; aj < 5; aj++) {
+        for (int ai = 0; ai < 8; ai++)
+        for (int aj = 0; aj < 8; aj++) {
             if (aj == ai) continue;
-            for (int ak = 0; ak < 5; ak++) {
+            for (int ak = 0; ak < 8; ak++) {
                 if (ak == ai || ak == aj) continue;
                 int r0 = sr[ai], r1 = sr[aj], r2 = sr[ak];
 
