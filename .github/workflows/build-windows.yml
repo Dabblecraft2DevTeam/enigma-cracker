@@ -24,27 +24,18 @@ jobs:
     - name: Clean and Build
       run: |
         # Clean any stale binaries
-        if (Test-Path enigma_cracker.exe) { Remove-Item enigma_cracker.exe -Force }
-        if (Test-Path enigma_cracker_gpu.exe) { Remove-Item enigma_cracker_gpu.exe -Force }
         if (Test-Path dist) { Remove-Item dist -Recurse -Force }
         if (Test-Path build) { Remove-Item build -Recurse -Force }
         if (Test-Path EnigmaCracker.spec) { Remove-Item EnigmaCracker.spec -Force }
         
-        # Verify source has 8 rotors
-        Select-String -Path enigma_cracker.c -Pattern "sr\[8\]" | ForEach-Object { Write-Host $_.Line }
-        Select-String -Path enigma_cracker.c -Pattern "0.035" | ForEach-Object { Write-Host $_.Line }
-        Select-String -Path enigma_cracker.c -Pattern "top_rings = ncand" | ForEach-Object { Write-Host $_.Line }
+        # CPU binary is pre-compiled and bundled from the repo (cross-compiled with MinGW)
+        # GPU binary is also pre-compiled and bundled (links against runtime OpenCL.dll)
+        # Verify both exist
+        Write-Host "CPU binary: $((Get-Item enigma_cracker.exe).Length) bytes"
+        Write-Host "GPU binary: $((Get-Item enigma_cracker_gpu.exe).Length) bytes"
         
-        # Build CPU binary
-        gcc -O3 -fopenmp -o enigma_cracker.exe enigma_cracker.c -lm
-        Write-Host "CPU binary built: $((Get-Item enigma_cracker.exe).Length) bytes"
-        
-        # Verify binary has 8 rotors by checking config count in output
-        $test = ./enigma_cracker.exe --ct "TEST" --mode M3 2>&1
-        Write-Host "Test output: $test"
-        
-        # Build PyInstaller bundle
-        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-data "german_words.txt;." --add-data "enigma_kernel.cl;." --add-data "enigma_cracker_gpu.c;." enigma_gui.py
+        # Build PyInstaller bundle with both binaries + kernel + word list
+        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-binary "enigma_cracker_gpu.exe;." --add-data "german_words.txt;." --add-data "enigma_kernel.cl;." enigma_gui.py
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
