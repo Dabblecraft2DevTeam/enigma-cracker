@@ -23,7 +23,7 @@ jobs:
     
     - name: Build standalone EXE
       run: |
-        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." enigma_gui.py
+        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-data "german_words.txt;." enigma_gui.py
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -44,6 +44,7 @@ jobs:
           **EnigmaCracker.exe** — Standalone Windows GUI application
           - No installation needed — just double-click
           - Includes Python runtime + Tkinter GUI + C cracker backend
+          - German dictionary-based word scoring (2800+ words)
           - OpenMP enabled for multi-core CPUs
           
           ### Usage

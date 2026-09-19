@@ -114,6 +114,115 @@ static int refw[4][26];    /* reflector wiring */
 /* German trigram score table: trigram_score[a][b][c] */
 static int tri_score[26][26][26];
 
+/* ────────────────────────────────────────────────────────── */
+/*  German dictionary hash set                                  */
+/* ────────────────────────────────────────────────────────── */
+
+#define DICT_HASH_SIZE 262144   /* power of 2, ~256K slots */
+#define DICT_MAX_WORD   32      /* max word length we store */
+
+static char  *dict_slots[DICT_HASH_SIZE];  /* heap-allocated word strings */
+static int    dict_count = 0;
+static int    dict_loaded = 0;   /* 1 = dictionary file was loaded */
+
+/* FNV-1a hash, masked to table size */
+static unsigned dict_hash(const char *word, int len)
+{
+    unsigned h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (unsigned char)word[i];
+        h *= 16777619u;
+    }
+    return h & (DICT_HASH_SIZE - 1);
+}
+
+/* Insert a word into the hash set (open addressing, linear probe) */
+static void dict_insert(const char *word)
+{
+    int len = (int)strlen(word);
+    if (len < 3 || len >= DICT_MAX_WORD) return;
+
+    unsigned h = dict_hash(word, len);
+    for (int i = 0; i < DICT_HASH_SIZE; i++) {
+        unsigned idx = (h + i) & (DICT_HASH_SIZE - 1);
+        if (!dict_slots[idx]) {
+            dict_slots[idx] = strdup(word);
+            dict_count++;
+            return;
+        }
+        if (strcmp(dict_slots[idx], word) == 0)
+            return;  /* already present */
+    }
+    /* table full — shouldn't happen with 256K slots and ~3K words */
+}
+
+/* Check if a word exists in the dictionary (open addressing lookup) */
+static int dict_contains(const char *word, int len)
+{
+    if (len < 3 || len >= DICT_MAX_WORD) return 0;
+
+    unsigned h = dict_hash(word, len);
+    for (int i = 0; i < DICT_HASH_SIZE; i++) {
+        unsigned idx = (h + i) & (DICT_HASH_SIZE - 1);
+        if (!dict_slots[idx])
+            return 0;  /* empty slot → not found */
+        if ((int)strlen(dict_slots[idx]) == len &&
+            strncmp(dict_slots[idx], word, len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Load german_words.txt from the given path. Returns number of words loaded. */
+static int load_german_dictionary(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[DICT_MAX_WORD];
+    while (fgets(line, sizeof(line), f)) {
+        /* strip whitespace, uppercase */
+        int len = 0;
+        for (int i = 0; line[i] && len < DICT_MAX_WORD - 1; i++) {
+            char c = line[i];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            if (c >= 'A' && c <= 'Z')
+                line[len++] = c;
+        }
+        line[len] = '\0';
+        if (len >= 3)
+            dict_insert(line);
+    }
+    fclose(f);
+    dict_loaded = 1;
+    return dict_count;
+}
+
+/* Try to load dictionary from several candidate paths relative to the binary */
+static void load_dictionary_auto(void)
+{
+    /* Try several locations:
+     *   1. german_words.txt in the same directory as the executable
+     *   2. ./german_words.txt (current working directory)
+     *   3. /usr/local/share/enigma_cracker/german_words.txt
+     */
+    const char *paths[] = {
+        "german_words.txt",
+        "./german_words.txt",
+        "/usr/local/share/enigma_cracker/german_words.txt",
+        NULL
+    };
+
+    for (int i = 0; paths[i]; i++) {
+        int n = load_german_dictionary(paths[i]);
+        if (n > 0) {
+            fprintf(stderr, "Loaded %d German dictionary words from %s\n", n, paths[i]);
+            return;
+        }
+    }
+    fprintf(stderr, "Warning: german_words.txt not found — using fallback trigram scoring\n");
+}
+
 static void init_tables(void)
 {
     for (int r = 0; r < 10; r++) {
@@ -291,7 +400,7 @@ static double ic_dbl(const char *t, int n)
     return (double)ic_num(t, n) / ((double)n * (n-1));
 }
 
-/* German trigram + common-word score */
+/* German trigram + common-word score (fallback when no dictionary) */
 static int german_score(const char *t, int n)
 {
     int s = 0;
@@ -311,6 +420,77 @@ static int german_score(const char *t, int n)
             if (strncmp(&t[i], words[w].w, words[w].len) == 0)
                 s += 25;
     return s;
+}
+
+/* ────────────────────────────────────────────────────────── */
+/*  Dictionary-based German word score                          */
+/*  Scans decrypted text for sequences of consecutive letters   */
+/*  and checks each against the loaded dictionary hash set.     */
+/*  Longer words score higher (weight = len * len).             */
+/*  This is a much stronger fitness function than trigrams,     */
+/*  especially for short messages.                              */
+/* ────────────────────────────────────────────────────────── */
+
+static int german_word_score(const char *t, int n)
+{
+    if (!dict_loaded || dict_count == 0)
+        return german_score(t, n);  /* fallback to trigram scoring */
+
+    int score = 0;
+    int i = 0;
+
+    while (i < n) {
+        /* Skip non-letter characters (spaces, X separators, etc.) */
+        if (t[i] < 'A' || t[i] > 'Z') {
+            i++;
+            continue;
+        }
+
+        /* Find the end of this letter sequence */
+        int start = i;
+        while (i < n && t[i] >= 'A' && t[i] <= 'Z')
+            i++;
+        int seglen = i - start;
+
+        /* Try all substrings of 3+ chars within this letter sequence.
+         * We try longest first for greedy matching, then shorter ones
+         * that don't overlap with found words.
+         *
+         * Strategy: scan for words left-to-right, greedily taking the
+         * longest match at each position. This avoids counting
+         * sub-words of a found word (e.g. DER inside ANGER).
+         */
+        int pos = 0;
+        while (pos < seglen) {
+            int found = 0;
+            /* Try longest possible word first (up to DICT_MAX_WORD-1) */
+            int maxlen = seglen - pos;
+            if (maxlen >= DICT_MAX_WORD) maxlen = DICT_MAX_WORD - 1;
+
+            for (int wlen = maxlen; wlen >= 3; wlen--) {
+                if (dict_contains(&t[start + pos], wlen)) {
+                    /* Weight by word length squared — longer words are
+                     * exponentially more significant */
+                    score += wlen * wlen;
+                    pos += wlen;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found)
+                pos++;
+        }
+    }
+
+    return score;
+}
+
+/* Unified scoring function: uses dictionary if loaded, else trigram fallback */
+static int german_fitness(const char *t, int n)
+{
+    if (dict_loaded && dict_count > 0)
+        return german_word_score(t, n);
+    return german_score(t, n);
 }
 
 /* ────────────────────────────────────────────────────────── */
@@ -423,7 +603,7 @@ static int hill_climb_m3(
 {
     plug_init(best_plug);
     m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, ref, best_plug, ct, n, best_out);
-    int best_gs = german_score(best_out, n);
+    int best_gs = german_fitness(best_out, n);
 
     int used[26] = {0};
 
@@ -444,7 +624,7 @@ static int hill_climb_m3(
                 char tmp[512];
                 m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, ref,
                            best_plug, ct, n, tmp);
-                int gs = german_score(tmp, n);
+                int gs = german_fitness(tmp, n);
                 /* IC_num * 100 + german_score — IC dominates */
                 double fit = ic_num(tmp, n) * 100.0 + gs;
 
@@ -484,7 +664,7 @@ static int hill_climb_m3(
                 char tmp[512];
                 m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, ref,
                            best_plug, ct, n, tmp);
-                int gs = german_score(tmp, n);
+                int gs = german_fitness(tmp, n);
                 double fit = ic_num(tmp, n) * 100.0 + gs;
 
                 if (fit > best_fit) {
@@ -510,7 +690,7 @@ static int hill_climb_m3(
                 char tmp[512];
                 m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, ref,
                            best_plug, ct, n, tmp);
-                int gs = german_score(tmp, n);
+                int gs = german_fitness(tmp, n);
                 double fit = ic_num(tmp, n) * 100.0 + gs;
 
                 if (fit > best_fit) {
@@ -538,7 +718,7 @@ static int hill_climb_m3(
         char tmp[512];
         m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, ref,
                    best_plug, ct, n, tmp);
-        int gs = german_score(tmp, n);
+        int gs = german_fitness(tmp, n);
         double fit = ic_num(tmp, n) * 100.0 + gs;
 
         if (fit > best_fit) {
@@ -552,7 +732,7 @@ static int hill_climb_m3(
     }
 
     m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, ref, best_plug, ct, n, best_out);
-    return german_score(best_out, n);
+    return german_fitness(best_out, n);
 }
 
 /* Hill climb for M4 (same algorithm, uses m4_encrypt) */
@@ -566,7 +746,7 @@ static int hill_climb_m4(
 {
     plug_init(best_plug);
     m4_encrypt(thin,r0,r1,r2, tp,p0,p1,p2, tg,g0,g1,g2, ref, best_plug, ct, n, best_out);
-    int best_gs = german_score(best_out, n);
+    int best_gs = german_fitness(best_out, n);
 
     int used[26] = {0};
     double best_fit = ic_num(best_out, n) * 100.0 + best_gs;
@@ -585,7 +765,7 @@ static int hill_climb_m4(
                 char tmp[512];
                 m4_encrypt(thin,r0,r1,r2, tp,p0,p1,p2, tg,g0,g1,g2, ref,
                            best_plug, ct, n, tmp);
-                int gs = german_score(tmp, n);
+                int gs = german_fitness(tmp, n);
                 double fit = ic_num(tmp, n) * 100.0 + gs;
 
                 if (fit > best_new) {
@@ -622,7 +802,7 @@ static int hill_climb_m4(
                 char tmp[512];
                 m4_encrypt(thin,r0,r1,r2, tp,p0,p1,p2, tg,g0,g1,g2, ref,
                            best_plug, ct, n, tmp);
-                int gs = german_score(tmp, n);
+                int gs = german_fitness(tmp, n);
                 double fit = ic_num(tmp, n) * 100.0 + gs;
 
                 if (fit > best_fit) {
@@ -645,7 +825,7 @@ static int hill_climb_m4(
                 char tmp[512];
                 m4_encrypt(thin,r0,r1,r2, tp,p0,p1,p2, tg,g0,g1,g2, ref,
                            best_plug, ct, n, tmp);
-                int gs = german_score(tmp, n);
+                int gs = german_fitness(tmp, n);
                 double fit = ic_num(tmp, n) * 100.0 + gs;
 
                 if (fit > best_fit) {
@@ -672,7 +852,7 @@ static int hill_climb_m4(
         char tmp[512];
         m4_encrypt(thin,r0,r1,r2, tp,p0,p1,p2, tg,g0,g1,g2, ref,
                    best_plug, ct, n, tmp);
-        int gs = german_score(tmp, n);
+        int gs = german_fitness(tmp, n);
         double fit = ic_num(tmp, n) * 100.0 + gs;
 
         if (fit > best_fit) {
@@ -685,7 +865,7 @@ static int hill_climb_m4(
     }
 
     m4_encrypt(thin,r0,r1,r2, tp,p0,p1,p2, tg,g0,g1,g2, ref, best_plug, ct, n, best_out);
-    return german_score(best_out, n);
+    return german_fitness(best_out, n);
 }
 
 /* ────────────────────────────────────────────────────────── */
@@ -1312,6 +1492,7 @@ static void print_usage(const char *prog)
 int main(int argc, char *argv[])
 {
     init_tables();
+    load_dictionary_auto();
 
     /* Parse arguments */
     const char *ct_arg = NULL;
