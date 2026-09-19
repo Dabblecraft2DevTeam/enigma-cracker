@@ -343,6 +343,13 @@ class EnigmaCrackerGUI:
             # Build command: use JSON output for reliable parsing
             cmd = [binary, "--ct", ct, "--mode", mode, "--format", "json"]
 
+            # For the GPU backend, pass the kernel file path so the binary
+            # can find enigma_kernel.cl when bundled with PyInstaller.
+            if backend == "gpu":
+                kernel_path = os.path.join(BUNDLE_DIR, "enigma_kernel.cl")
+                if os.path.isfile(kernel_path):
+                    cmd += ["--kernel", kernel_path]
+
             # Start process
             self.process = subprocess.Popen(
                 cmd,

@@ -1048,19 +1048,28 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
         int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
         int rf = cand[c].ref;
         int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
-        int best_ic = cand[c].ic;
+        /* Use combined IC + German fitness for ring search.
+           IC alone rarely distinguishes ring settings (it measures
+           frequency distribution, which barely changes with rings).
+           German word score responds to the actual decryption quality. */
+        char tmp[512];
+        m3_encrypt(r0,r1,r2, p0,p1,p2, 0,0,0, rf, idplug, ct, n, tmp);
+        int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
         int bg0 = 0, bg1 = 0, bg2 = 0;
 
         for (int g0 = 0; g0 < 26; g0++)
         for (int g1 = 0; g1 < 26; g1++)
         for (int g2 = 0; g2 < 26; g2++) {
-            int ic = fast_ic_m3(r0,r1,r2, p0,p1,p2, g0,g1,g2, rf, idplug, ct, n);
-            if (ic > best_ic) {
-                best_ic = ic;
+            m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, rf, idplug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+            if (fit > best_fit) {
+                best_fit = fit;
                 bg0 = g0; bg1 = g1; bg2 = g2;
             }
         }
-        cand[c].ic = best_ic;
+        /* Update candidate IC to the IC at best rings (for re-sorting) */
+        m3_encrypt(r0,r1,r2, p0,p1,p2, bg0,bg1,bg2, rf, idplug, ct, n, tmp);
+        cand[c].ic = ic_num(tmp, n);
         cand[c].g0 = bg0;
         cand[c].g1 = bg1;
         cand[c].g2 = bg2;
@@ -1295,21 +1304,27 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
         int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
         int thin = cand[c].thin;
         int tp = cand[c].tp;
-        int best_ic = cand[c].ic;
+        /* Use combined IC + German fitness for ring search (same as M3) */
+        char tmp[512];
+        m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,0, rf, idplug, ct, n, tmp);
+        int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
         int bg0 = 0, bg1 = 0, bg2 = 0;
 
         /* Search all 26^3 ring settings (thin ring tg=0) */
         for (int g0 = 0; g0 < 26; g0++)
         for (int g1 = 0; g1 < 26; g1++)
         for (int g2 = 0; g2 < 26; g2++) {
-            int ic = fast_ic_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,g0,g1,g2, rf, idplug, ct, n);
-            if (ic > best_ic) {
-                best_ic = ic;
+            m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,g0,g1,g2, rf, idplug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+            if (fit > best_fit) {
+                best_fit = fit;
                 bg0 = g0; bg1 = g1; bg2 = g2;
             }
         }
 
-        cand[c].ic = best_ic;
+        /* Update candidate IC to the IC at best rings (for re-sorting) */
+        m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,bg0,bg1,bg2, rf, idplug, ct, n, tmp);
+        cand[c].ic = ic_num(tmp, n);
         cand[c].g0 = bg0;
         cand[c].g1 = bg1;
         cand[c].g2 = bg2;

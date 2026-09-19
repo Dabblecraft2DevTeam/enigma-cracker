@@ -35,6 +35,11 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifndef _WIN32
+#include <unistd.h>  /* readlink */
+#endif
+
+#include "german_words_embedded.h"  /* Embedded German word list fallback */
 
 /* ────────────────────────────────────────────────────────── */
 /*  Cross-platform timing                                      */
@@ -58,6 +63,37 @@ static double now_sec(void) {
     return tv.tv_sec + tv.tv_usec * 1e-6;
 }
 #endif
+
+/* ────────────────────────────────────────────────────────── */
+/*  Executable directory (for finding enigma_kernel.cl)        */
+/* ────────────────────────────────────────────────────────── */
+
+/* Returns the directory containing the running executable.
+ * On Windows uses GetModuleFileName; on Linux reads /proc/self/exe.
+ * Returns NULL on failure.  Caller must not free the returned pointer
+ * (it points to a static buffer). */
+static const char *exe_dir(void)
+{
+    static char buf[1024];
+#ifdef _WIN32
+    DWORD len = GetModuleFileNameA(NULL, buf, sizeof(buf));
+    if (len == 0 || len >= sizeof(buf)) return NULL;
+#else
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len < 0) return NULL;
+    buf[len] = '\0';
+#endif
+    /* Strip the filename, keep only the directory */
+    char *slash = strrchr(buf, '/');
+    char *bslash = strrchr(buf, '\\');
+    char *last = (bslash > slash) ? bslash : slash;
+    if (last) {
+        last[1] = '\0';
+    } else {
+        buf[0] = '\0';
+    }
+    return buf;
+}
 
 /* ────────────────────────────────────────────────────────── */
 /*  Rotor and reflector data (identical to enigma_cracker.c)   */
@@ -206,7 +242,12 @@ static void load_dictionary_auto(void)
             return;
         }
     }
-    fprintf(stderr, "Warning: german_words.txt not found — using fallback trigram scoring\n");
+    fprintf(stderr, "german_words.txt not found — using embedded word list (%d words)\n", EMBEDDED_WORD_COUNT);
+    /* Load embedded words as fallback */
+    for (int i = 0; i < EMBEDDED_WORD_COUNT; i++) {
+        dict_insert(embedded_words[i]);
+    }
+    dict_loaded = 1;
 }
 
 static void init_tables(void)
@@ -775,7 +816,8 @@ static int gpu_phase1(
     int threshold,
     Cand *cand_out,
     long long *config_count,
-    int json_mode)
+    int json_mode,
+    const char *kernel_path)  /* explicit --kernel path, or NULL */
 {
     cl_int err;
     cl_platform_id platform;
@@ -811,16 +853,37 @@ static int gpu_phase1(
     int n_perms = gen_perms(perms, sr, 8);
     (void)n_perms; /* should be 336 */
 
-    /* Load kernel source */
-    const char *kernel_paths[] = {
-        "enigma_kernel.cl",
-        "./enigma_kernel.cl",
-        NULL
-    };
+    /* Load kernel source — search in order:
+     *   1. Explicit --kernel path (from GUI / PyInstaller)
+     *   2. Executable's directory (GetModuleFileName / /proc/self/exe)
+     *   3. Current directory / ./enigma_kernel.cl
+     */
+    const char *kernel_paths[8];
+    int n_paths = 0;
+    char exe_kernel[1024];
+
+    if (kernel_path)
+        kernel_paths[n_paths++] = kernel_path;
+
+    /* Build "<exe_dir>/enigma_kernel.cl" */
+    const char *ed = exe_dir();
+    if (ed && ed[0]) {
+        snprintf(exe_kernel, sizeof(exe_kernel), "%senigma_kernel.cl", ed);
+        kernel_paths[n_paths++] = exe_kernel;
+    }
+
+    kernel_paths[n_paths++] = "enigma_kernel.cl";
+    kernel_paths[n_paths++] = "./enigma_kernel.cl";
+    kernel_paths[n_paths] = NULL;
+
     char *kernel_src = NULL;
-    for (int i = 0; kernel_paths[i]; i++) {
+    for (int i = 0; i < n_paths; i++) {
         kernel_src = load_kernel_file(kernel_paths[i]);
-        if (kernel_src) break;
+        if (kernel_src) {
+            if (!json_mode)
+                fprintf(stderr, "Loaded kernel from %s\n", kernel_paths[i]);
+            break;
+        }
     }
     if (!kernel_src) {
         fprintf(stderr, "Warning: enigma_kernel.cl not found, cannot use GPU\n");
@@ -1280,7 +1343,7 @@ static int cpu_phase1_m4(const char *ct, int n, int threshold, Cand *cand, int j
 /*  Unified cracker: GPU Phase 1 + CPU Phase 2/3               */
 /* ────────────────────────────────────────────────────────── */
 
-static CrackResult crack(const char *ct, int n, int is_m4, int json_mode, int force_cpu)
+static CrackResult crack(const char *ct, int n, int is_m4, int json_mode, int force_cpu, const char *kernel_path)
 {
     CrackResult result;
     memset(&result, 0, sizeof(result));
@@ -1299,7 +1362,7 @@ static CrackResult crack(const char *ct, int n, int is_m4, int json_mode, int fo
     if (!force_cpu && ocl_available()) {
         if (!json_mode)
             printf("Phase 1 (GPU/OpenCL): brute-force all rotor perms × positions with IC scoring...\n");
-        int ret = gpu_phase1(is_m4, ct, n, thresh, cand, &config_count, json_mode);
+        int ret = gpu_phase1(is_m4, ct, n, thresh, cand, &config_count, json_mode, kernel_path);
         if (ret < 0) {
             if (!json_mode)
                 printf("  GPU failed, falling back to CPU...\n");
@@ -1345,27 +1408,45 @@ static CrackResult crack(const char *ct, int n, int is_m4, int json_mode, int fo
         int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
         int rf = cand[c].ref;
         int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
-        int best_ic = cand[c].ic;
         int bg0 = 0, bg1 = 0, bg2 = 0;
+        char tmp[512];
 
         if (is_m4) {
             int thin = cand[c].thin, tp = cand[c].tp;
+            /* Use combined IC + German fitness for ring search (same as CPU).
+               IC alone rarely distinguishes ring settings (it measures
+               frequency distribution, which barely changes with rings).
+               German word score responds to the actual decryption quality. */
+            m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,0, rf, idplug, ct, n, tmp);
+            int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+
             for (int g0 = 0; g0 < 26; g0++)
             for (int g1 = 0; g1 < 26; g1++)
             for (int g2 = 0; g2 < 26; g2++) {
-                int ic = fast_ic_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,g0,g1,g2, rf, idplug, ct, n);
-                if (ic > best_ic) { best_ic = ic; bg0 = g0; bg1 = g1; bg2 = g2; }
+                m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,g0,g1,g2, rf, idplug, ct, n, tmp);
+                int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+                if (fit > best_fit) { best_fit = fit; bg0 = g0; bg1 = g1; bg2 = g2; }
             }
+            /* Update candidate IC to the IC at best rings (for re-sorting) */
+            m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,bg0,bg1,bg2, rf, idplug, ct, n, tmp);
+            cand[c].ic = ic_num(tmp, n);
         } else {
+            /* Use combined IC + German fitness for ring search (same as CPU). */
+            m3_encrypt(r0,r1,r2, p0,p1,p2, 0,0,0, rf, idplug, ct, n, tmp);
+            int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+
             for (int g0 = 0; g0 < 26; g0++)
             for (int g1 = 0; g1 < 26; g1++)
             for (int g2 = 0; g2 < 26; g2++) {
-                int ic = fast_ic_m3(r0,r1,r2, p0,p1,p2, g0,g1,g2, rf, idplug, ct, n);
-                if (ic > best_ic) { best_ic = ic; bg0 = g0; bg1 = g1; bg2 = g2; }
+                m3_encrypt(r0,r1,r2, p0,p1,p2, g0,g1,g2, rf, idplug, ct, n, tmp);
+                int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+                if (fit > best_fit) { best_fit = fit; bg0 = g0; bg1 = g1; bg2 = g2; }
             }
+            /* Update candidate IC to the IC at best rings (for re-sorting) */
+            m3_encrypt(r0,r1,r2, p0,p1,p2, bg0,bg1,bg2, rf, idplug, ct, n, tmp);
+            cand[c].ic = ic_num(tmp, n);
         }
 
-        cand[c].ic = best_ic;
         cand[c].g0 = bg0; cand[c].g1 = bg1; cand[c].g2 = bg2;
         fprintf(stderr, "PROGRESS:phase2:%d:%d\n", c+1, top_rings);
         fflush(stderr);
@@ -1549,6 +1630,7 @@ static void print_usage(const char *prog)
         "  --mode M3|M4       Enigma model (default: M3)\n"
         "  --format text|json Output format (default: text)\n"
         "  --cpu              Force CPU fallback (no GPU)\n"
+        "  --kernel <PATH>    Path to enigma_kernel.cl (default: search exe dir + cwd)\n"
         "  --help             Show this help\n"
         "\n"
         "If no --ct or --stdin is given, runs self-test mode.\n"
@@ -1572,6 +1654,7 @@ int main(int argc, char *argv[])
     int json_mode = 0;
     int is_m4 = 0;
     int force_cpu = 0;
+    const char *kernel_arg = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ct") == 0 && i + 1 < argc) {
@@ -1584,6 +1667,8 @@ int main(int argc, char *argv[])
             format_str = argv[++i];
         } else if (strcmp(argv[i], "--cpu") == 0) {
             force_cpu = 1;
+        } else if (strcmp(argv[i], "--kernel") == 0 && i + 1 < argc) {
+            kernel_arg = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -1714,7 +1799,7 @@ int main(int argc, char *argv[])
         printf("  %s\n\n", test_ct);
         printf("Now brute-forcing from ciphertext only (no settings provided)...\n\n");
 
-        CrackResult r = crack(test_ct, test_n, 0, 0, force_cpu);
+        CrackResult r = crack(test_ct, test_n, 0, 0, force_cpu, kernel_arg);
 
         printf("\n================================================================\n");
         printf("  DONE\n");
@@ -1742,7 +1827,7 @@ int main(int argc, char *argv[])
         printf("Ciphertext (%d chars): %s\n\n", ct_n, ct);
     }
 
-    CrackResult r = crack(ct, ct_n, is_m4, json_mode, force_cpu);
+    CrackResult r = crack(ct, ct_n, is_m4, json_mode, force_cpu, kernel_arg);
 
     if (json_mode) {
         print_json_result(&r);
