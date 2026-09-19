@@ -30,6 +30,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include "german_words_embedded.h"  /* Embedded German word list fallback */
 
 /* ────────────────────────────────────────────────────────── */
 /*  Cross-platform timing                                      */
@@ -220,7 +221,12 @@ static void load_dictionary_auto(void)
             return;
         }
     }
-    fprintf(stderr, "Warning: german_words.txt not found — using fallback trigram scoring\n");
+    fprintf(stderr, "german_words.txt not found — using embedded word list (%d words)\n", EMBEDDED_WORD_COUNT);
+    /* Load embedded words as fallback */
+    for (int i = 0; i < EMBEDDED_WORD_COUNT; i++) {
+        dict_insert(embedded_words[i]);
+    }
+    dict_loaded = 1;
 }
 
 static void init_tables(void)
