@@ -744,8 +744,8 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
     int sref[2] = {REF_B, REF_C};
     int idplug[26]; plug_init(idplug);
 
-    /* IC threshold ≈ 0.050 × n × (n−1) */
-    int thresh = (int)(0.050 * (double)n * (n - 1));
+    /* IC threshold — lowered for better short-message coverage */
+    int thresh = (int)(0.035 * (double)n * (n - 1));
 
     Cand cand[MAX_CAND];
     int ncand = 0;
@@ -982,7 +982,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     int thin_rotors[2] = {R_BETA, R_GAMMA};
     int idplug[26]; plug_init(idplug);
 
-    int thresh = (int)(0.050 * (double)n * (n - 1));
+    int thresh = (int)(0.035 * (double)n * (n - 1));
 
     /* Total: 2 thin × 26 thin_pos × 60 rotor_perms × 2 ref × 26³ positions */
     long long total = 2LL * 26 * 60 * 2 * 26*26*26;
