@@ -23,7 +23,7 @@ jobs:
     
     - name: Build standalone EXE
       run: |
-        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-data "german_words.txt;." enigma_gui.py
+        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-data "german_words.txt;." --add-data "enigma_kernel.cl;." enigma_gui.py
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -46,16 +46,32 @@ jobs:
           - Includes Python runtime + Tkinter GUI + C cracker backend
           - German dictionary-based word scoring (2800+ words)
           - OpenMP enabled for multi-core CPUs
+          - OpenCL GPU acceleration support (AMD/NVIDIA)
+          - All 8 rotors (I-VIII) searched in M3 and M4 modes
+          - X word separator handling for German Enigma messages
           
           ### Usage
           1. Download EnigmaCracker.exe
           2. Double-click to open the GUI
           3. Paste Enigma ciphertext into the text field
           4. Select M3 or M4 mode
-          5. Click Crack
+          5. Select CPU or GPU backend
+          6. Click Crack
           
-          ### Performance (24 threads)
-          | Mode | Configs | Time |
-          |------|---------|------|
-          | M3 | 2.1M | ~2s |
-          | M4 | 109M | ~40s |
+          ### Performance (24 threads / AMD 9070 XT GPU)
+          | Mode | Configs | CPU Time | GPU Time |
+          |------|---------|----------|----------|
+          | M3 | 11.8M | ~5s | ~0.01s |
+          | M4 | 614M | ~40s | ~0.3s |
+          
+          ### Features
+          - Full Enigma M3 (3-rotor) and M4 (4-rotor Naval) simulation
+          - All rotors I-VIII + beta + gamma
+          - All reflectors B, C, B_thin, C_thin
+          - Brute force: rotor permutations × positions × ring settings
+          - Fitness: Index of Coincidence + German dictionary + trigram scoring
+          - Hill climbing on plugboard
+          - X word separator handling
+          - GPU acceleration via OpenCL (AMD/NVIDIA)
+          - CPU fallback via OpenMP
+          - Cross-platform: Linux (gcc), Windows (MinGW)
