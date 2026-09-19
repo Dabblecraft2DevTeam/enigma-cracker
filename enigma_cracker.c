@@ -723,6 +723,9 @@ typedef struct {
     int r0, r1, r2;
     int ref;
     int p0, p1, p2;
+    int g0, g1, g2;   /* best ring settings found in Phase 2 */
+    int thin;         /* thin rotor index (M4 only) */
+    int tp;           /* thin rotor position (M4 only) */
 } Cand;
 
 static int cand_cmp(const void *a, const void *b)
@@ -780,6 +783,7 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
                         cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
                         cand[ncand].ref = sref[rf];
                         cand[ncand].p0 = p0; cand[ncand].p1 = p1; cand[ncand].p2 = p2;
+                        cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
                         ncand++;
                         if (ic < min_ic || ncand == 1) min_ic = ic;
                         /* recompute min if array just filled */
@@ -800,6 +804,7 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
                         cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
                         cand[ncand].ref = sref[rf];
                         cand[ncand].p0 = p0; cand[ncand].p1 = p1; cand[ncand].p2 = p2;
+                        cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
                         ncand++;
                         /* recompute min */
                         min_ic = INT_MAX;
@@ -832,10 +837,12 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
 
     qsort(cand, ncand, sizeof(Cand), cand_cmp);
 
-    /* Phase 2: ring search on top candidates */
-    int top_rings = ncand < 20 ? ncand : 20;
+    /* Phase 2: ring search on ALL candidates */
+    /* Search all 26^3 ring settings for every candidate so that even
+       settings with mediocre IC at rings=AAA get a full ring sweep. */
+    int top_rings = ncand;
     if (!json_mode)
-        printf("Phase 2: Ring search on top %d candidates (26³ = 17,576 rings each)\n", top_rings);
+        printf("Phase 2: Ring search on all %d candidates (26³ = 17,576 rings each)...\n", top_rings);
     fprintf(stderr, "PROGRESS:phase2:0:%d\n", top_rings);
     fflush(stderr);
 
@@ -856,6 +863,9 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
             }
         }
         cand[c].ic = best_ic;
+        cand[c].g0 = bg0;
+        cand[c].g1 = bg1;
+        cand[c].g2 = bg2;
         fprintf(stderr, "PROGRESS:phase2:%d:%d\n", c+1, top_rings);
         fflush(stderr);
     }
@@ -883,34 +893,17 @@ static CrackResult brute_force_m3(const char *ct, int n, int json_mode)
         int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
         int rf = cand[c].ref;
         int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
+        /* Use the best ring settings found in Phase 2 */
+        int bg0 = cand[c].g0, bg1 = cand[c].g1, bg2 = cand[c].g2;
 
-        /* Try with rings=0 (best for self-test) and also search rings */
         int plug[26];
         char out[512];
 
-        /* Rings = 0 */
-        int gs0 = hill_climb_m3(r0,r1,r2, p0,p1,p2, 0,0,0, rf, ct, n, plug, out);
+        /* Hill climb with the best ring settings from Phase 2 */
+        int gs = hill_climb_m3(r0,r1,r2, p0,p1,p2, bg0,bg1,bg2, rf, ct, n, plug, out);
 
-        /* Also try a few ring settings near positions */
-        int gs = gs0;
         memcpy(best_plug, plug, sizeof(plug));
         strcpy(best_text, out);
-        int bg0=0, bg1=0, bg2=0;
-
-        /* Quick ring scan: try all 26^3 rings but only with hill climb on top */
-        /* For speed, just try a few offsets */
-        for (int g2 = 0; g2 < 26; g2++) {
-            int ic = fast_ic_m3(r0,r1,r2, p0,p1,p2, 0,0,g2, rf, idplug, ct, n);
-            if (ic > cand[c].ic + 2) {
-                int gs_r = hill_climb_m3(r0,r1,r2, p0,p1,p2, 0,0,g2, rf, ct, n, plug, out);
-                if (gs_r > gs) {
-                    gs = gs_r;
-                    memcpy(best_plug, plug, sizeof(plug));
-                    strcpy(best_text, out);
-                    bg0=0; bg1=0; bg2=g2;
-                }
-            }
-        }
 
         if (!json_mode) {
             printf("  #%d  Rotors %s,%s,%s  Ref %s  Pos %c%c%c  Rings %c%c%c\n",
@@ -1007,11 +1000,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     int ncand = 0;
     int min_ic = 0;
 
-    /* Extended candidate to store M4-specific fields */
-    int cand_thin[MAX_CAND];
-    int cand_tp[MAX_CAND];
-
-    #pragma omp parallel for collapse(2) schedule(dynamic) reduction(+:cnt) shared(cand, ncand, min_ic, cand_thin, cand_tp)
+    #pragma omp parallel for collapse(2) schedule(dynamic) reduction(+:cnt) shared(cand, ncand, min_ic)
     for (int thi = 0; thi < 2; thi++)
     for (int tp = 0; tp < 26; tp++) {
         for (int ai = 0; ai < 5; ai++)
@@ -1039,8 +1028,9 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
                             cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
                             cand[ncand].ref = sref[rf];
                             cand[ncand].p0 = p0; cand[ncand].p1 = p1; cand[ncand].p2 = p2;
-                            cand_thin[ncand] = thin_rotors[thi];
-                            cand_tp[ncand] = tp;
+                            cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
+                            cand[ncand].thin = thin_rotors[thi];
+                            cand[ncand].tp = tp;
                             ncand++;
                             if (ic < min_ic || ncand == 1) min_ic = ic;
                             if (ncand == MAX_CAND) {
@@ -1053,15 +1043,14 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
                             for (int k = 1; k < ncand; k++)
                                 if (cand[k].ic < cand[mi].ic) mi = k;
                             cand[mi] = cand[ncand-1];
-                            cand_thin[mi] = cand_thin[ncand-1];
-                            cand_tp[mi] = cand_tp[ncand-1];
                             ncand--;
                             cand[ncand].ic = ic;
                             cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
                             cand[ncand].ref = sref[rf];
                             cand[ncand].p0 = p0; cand[ncand].p1 = p1; cand[ncand].p2 = p2;
-                            cand_thin[ncand] = thin_rotors[thi];
-                            cand_tp[ncand] = tp;
+                            cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
+                            cand[ncand].thin = thin_rotors[thi];
+                            cand[ncand].tp = tp;
                             ncand++;
                             min_ic = INT_MAX;
                             for (int k = 0; k < ncand; k++)
@@ -1093,67 +1082,46 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     }
 
     qsort(cand, ncand, sizeof(Cand), cand_cmp);
-    /* Note: qsort moves cand but not the parallel arrays.
-       We need to re-sort the parallel arrays too. Simple approach:
-       just use the sorted order from cand, and for the parallel arrays
-       we'll search them by matching. Actually, let's just do a simple
-       bubble sort alongside. Better: let's not use qsort and do manual sort. */
-    /* Actually, qsort only sorts the cand array. The parallel arrays
-       (cand_thin, cand_tp) won't follow. We need to fix this.
-       Let's merge the thin info into the Cand struct temporarily by
-       using unused fields... but there are none.
-       Instead, let's create a combined sort. */
 
-    /* Create an index array and sort by cand[].ic descending */
-    int idx[MAX_CAND];
-    for (int i = 0; i < ncand; i++) idx[i] = i;
-    /* Simple insertion sort by ic descending */
-    for (int i = 1; i < ncand; i++) {
-        int j = i;
-        while (j > 0 && cand[idx[j]].ic > cand[idx[j-1]].ic) {
-            int tmp = idx[j]; idx[j] = idx[j-1]; idx[j-1] = tmp;
-            j--;
-        }
-    }
-
-    /* Phase 2: ring search on top candidates */
-    int top_rings = ncand < 20 ? ncand : 20;
+    /* Phase 2: ring search on ALL candidates */
+    /* Search all 26^3 ring settings for every candidate (thin ring stays at 0). */
+    int top_rings = ncand;
     if (!json_mode)
-        printf("Phase 2: Ring search on top %d candidates\n", top_rings);
+        printf("Phase 2: Ring search on all %d candidates (26³ = 17,576 rings each)...\n", top_rings);
     fprintf(stderr, "PROGRESS:phase2:0:%d\n", top_rings);
     fflush(stderr);
 
     for (int c = 0; c < top_rings; c++) {
-        int ci = idx[c];
-        int r0 = cand[ci].r0, r1 = cand[ci].r1, r2 = cand[ci].r2;
-        int rf = cand[ci].ref;
-        int p0 = cand[ci].p0, p1 = cand[ci].p1, p2 = cand[ci].p2;
-        int thin = cand_thin[ci];
-        int tp = cand_tp[ci];
-        int best_ic = cand[ci].ic;
+        int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
+        int rf = cand[c].ref;
+        int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
+        int thin = cand[c].thin;
+        int tp = cand[c].tp;
+        int best_ic = cand[c].ic;
+        int bg0 = 0, bg1 = 0, bg2 = 0;
 
-        /* For M4, search right ring only for speed (thin ring = 0) */
+        /* Search all 26^3 ring settings (thin ring tg=0) */
+        for (int g0 = 0; g0 < 26; g0++)
+        for (int g1 = 0; g1 < 26; g1++)
         for (int g2 = 0; g2 < 26; g2++) {
-            int ic = fast_ic_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,g2, rf, idplug, ct, n);
+            int ic = fast_ic_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,g0,g1,g2, rf, idplug, ct, n);
             if (ic > best_ic) {
                 best_ic = ic;
-                cand[ci].ic = best_ic;
+                bg0 = g0; bg1 = g1; bg2 = g2;
             }
         }
+
+        cand[c].ic = best_ic;
+        cand[c].g0 = bg0;
+        cand[c].g1 = bg1;
+        cand[c].g2 = bg2;
 
         fprintf(stderr, "PROGRESS:phase2:%d:%d\n", c+1, top_rings);
         fflush(stderr);
     }
 
     /* Re-sort after ring search */
-    for (int i = 0; i < ncand; i++) idx[i] = i;
-    for (int i = 1; i < ncand; i++) {
-        int j = i;
-        while (j > 0 && cand[idx[j]].ic > cand[idx[j-1]].ic) {
-            int tmp = idx[j]; idx[j] = idx[j-1]; idx[j-1] = tmp;
-            j--;
-        }
-    }
+    qsort(cand, ncand, sizeof(Cand), cand_cmp);
 
     double t2 = now_sec();
     if (!json_mode)
@@ -1173,47 +1141,32 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     int bG0=0,bG1=0,bG2=0;
 
     for (int c = 0; c < top_hc; c++) {
-        int ci = idx[c];
-        int r0 = cand[ci].r0, r1 = cand[ci].r1, r2 = cand[ci].r2;
-        int rf = cand[ci].ref;
-        int p0 = cand[ci].p0, p1 = cand[ci].p1, p2 = cand[ci].p2;
-        int thin = cand_thin[ci];
-        int tp = cand_tp[ci];
+        int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
+        int rf = cand[c].ref;
+        int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
+        int thin = cand[c].thin;
+        int tp = cand[c].tp;
+        /* Use the best ring settings found in Phase 2 */
+        int bg0 = cand[c].g0, bg1 = cand[c].g1, bg2 = cand[c].g2;
 
         int plug[26];
         char out[512];
 
-        /* Rings = 0 */
-        int gs0 = hill_climb_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,0, rf, ct, n, plug, out);
+        /* Hill climb with the best ring settings from Phase 2 */
+        int gs = hill_climb_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,bg0,bg1,bg2, rf, ct, n, plug, out);
 
-        /* Quick ring scan on right ring */
-        int gs = gs0;
         memcpy(best_plug, plug, sizeof(plug));
         strcpy(best_text, out);
-        int bg2 = 0;
-
-        for (int g2 = 1; g2 < 26; g2++) {
-            int ic = fast_ic_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,g2, rf, idplug, ct, n);
-            if (ic > cand[ci].ic + 2) {
-                int gs_r = hill_climb_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,g2, rf, ct, n, plug, out);
-                if (gs_r > gs) {
-                    gs = gs_r;
-                    memcpy(best_plug, plug, sizeof(plug));
-                    strcpy(best_text, out);
-                    bg2 = g2;
-                }
-            }
-        }
 
         if (!json_mode) {
-            printf("  #%d  Thin %s  Rotors %s,%s,%s  Ref %s  ThinPos %c  Pos %c%c%c  Rings A A %c\n",
+            printf("  #%d  Thin %s  Rotors %s,%s,%s  Ref %s  ThinPos %c  Pos %c%c%c  Rings %c%c%c\n",
                    c+1,
                    ROTOR_NAME[thin],
                    ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2],
                    REFLECTOR_NAME[rf],
                    tp+'A',
                    p0+'A', p1+'A', p2+'A',
-                   bg2+'A');
+                   bg0+'A', bg1+'A', bg2+'A');
             printf("       IC=%.4f  German=%d\n", ic_dbl(out, n), gs);
             printf("       Plug: ");
             for (int i = 0; i < 26; i++)
@@ -1229,7 +1182,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
             bThin = thin;
             bR0=r0; bR1=r1; bR2=r2; bRef=rf;
             bTp=tp; bP0=p0; bP1=p1; bP2=p2;
-            bG2=bg2;
+            bG0=bg0; bG1=bg1; bG2=bg2;
         }
     }
 
@@ -1241,7 +1194,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     result.ref = bRef;
     result.tp = bTp;
     result.p0 = bP0; result.p1 = bP1; result.p2 = bP2;
-    result.g0 = 0; result.g1 = 0; result.g2 = bG2;
+    result.g0 = bG0; result.g1 = bG1; result.g2 = bG2;
     result.tg = 0;
     memcpy(result.plug, best_plug, sizeof(best_plug));
     strncpy(result.text, best_text, sizeof(result.text)-1);
@@ -1260,7 +1213,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
         printf("Reflector:   %s\n", REFLECTOR_NAME[bRef]);
         printf("Thin Pos:    %c\n", bTp+'A');
         printf("Positions:   %c%c%c\n", bP0+'A', bP1+'A', bP2+'A');
-        printf("Rings:       A A %c\n", bG2+'A');
+        printf("Rings:       %c%c%c\n", bG0+'A', bG1+'A', bG2+'A');
         printf("Plugboard:   ");
         for (int i = 0; i < 26; i++)
             if (best_plug[i] > i) printf("%c%c ", i+'A', best_plug[i]+'A');
@@ -1298,7 +1251,7 @@ static void print_json_result(const CrackResult *r)
            r->p0+'A', r->p1+'A', r->p2+'A');
 
     if (r->is_m4)
-        printf("  \"rings\": \"A A %c\",\n", r->g2+'A');
+        printf("  \"rings\": \"%c%c%c\",\n", r->g0+'A', r->g1+'A', r->g2+'A');
     else
         printf("  \"rings\": \"%c%c%c\",\n",
                r->g0+'A', r->g1+'A', r->g2+'A');
