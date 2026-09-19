@@ -21,14 +21,29 @@ jobs:
     - name: Install PyInstaller
       run: pip install pyinstaller
     
-    - name: Build standalone EXE
+    - name: Clean and Build
       run: |
-        # Build CPU binary (always works on Windows)
+        # Clean any stale binaries
+        if (Test-Path enigma_cracker.exe) { Remove-Item enigma_cracker.exe -Force }
+        if (Test-Path enigma_cracker_gpu.exe) { Remove-Item enigma_cracker_gpu.exe -Force }
+        if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+        if (Test-Path build) { Remove-Item build -Recurse -Force }
+        if (Test-Path EnigmaCracker.spec) { Remove-Item EnigmaCracker.spec -Force }
+        
+        # Verify source has 8 rotors
+        Select-String -Path enigma_cracker.c -Pattern "sr\[8\]" | ForEach-Object { Write-Host $_.Line }
+        Select-String -Path enigma_cracker.c -Pattern "0.035" | ForEach-Object { Write-Host $_.Line }
+        Select-String -Path enigma_cracker.c -Pattern "top_rings = ncand" | ForEach-Object { Write-Host $_.Line }
+        
+        # Build CPU binary
         gcc -O3 -fopenmp -o enigma_cracker.exe enigma_cracker.c -lm
-        # GPU binary requires OpenCL headers from AMD/NVIDIA drivers
-        # which aren't available on GitHub Actions. The GUI will compile
-        # it locally on the user's machine if they have GPU drivers.
-        # Build PyInstaller bundle with CPU binary + GPU source + kernel + word list
+        Write-Host "CPU binary built: $((Get-Item enigma_cracker.exe).Length) bytes"
+        
+        # Verify binary has 8 rotors by checking config count in output
+        $test = ./enigma_cracker.exe --ct "TEST" --mode M3 2>&1
+        Write-Host "Test output: $test"
+        
+        # Build PyInstaller bundle
         pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-data "german_words.txt;." --add-data "enigma_kernel.cl;." --add-data "enigma_cracker_gpu.c;." enigma_gui.py
     
     - name: Upload artifact
@@ -52,9 +67,9 @@ jobs:
           - Includes Python runtime + Tkinter GUI + C cracker backend
           - German dictionary-based word scoring (2800+ words)
           - OpenMP enabled for multi-core CPUs
-          - OpenCL GPU acceleration support (AMD/NVIDIA)
+          - OpenCL GPU support (compiled locally if GPU drivers present)
           - All 8 rotors (I-VIII) searched in M3 and M4 modes
-          - X word separator handling for German Enigma messages
+          - X word separator handling
           
           ### Usage
           1. Download EnigmaCracker.exe
@@ -68,16 +83,4 @@ jobs:
           | Mode | Configs | CPU Time | GPU Time |
           |------|---------|----------|----------|
           | M3 | 11.8M | ~5s | ~0.01s |
-          | M4 | 614M | ~40s | ~0.3s |
-          
-          ### Features
-          - Full Enigma M3 (3-rotor) and M4 (4-rotor Naval) simulation
-          - All rotors I-VIII + beta + gamma
-          - All reflectors B, C, B_thin, C_thin
-          - Brute force: rotor permutations × positions × ring settings
-          - Fitness: Index of Coincidence + German dictionary + trigram scoring
-          - Hill climbing on plugboard
-          - X word separator handling
-          - GPU acceleration via OpenCL (AMD/NVIDIA)
-          - CPU fallback via OpenMP
-          - Cross-platform: Linux (gcc), Windows (MinGW)
+          | M4 | 614M | ~75s | ~0.3s |
