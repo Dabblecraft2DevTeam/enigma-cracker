@@ -38,12 +38,17 @@ else:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 C_SOURCE = os.path.join(SCRIPT_DIR, "enigma_cracker.c")
+GPU_SOURCE = os.path.join(SCRIPT_DIR, "enigma_cracker_gpu.c")
+KERNEL_FILE = os.path.join(SCRIPT_DIR, "enigma_kernel.cl")
 BINARY_NAME = "enigma_cracker" if sys.platform != "win32" else "enigma_cracker.exe"
+GPU_BINARY_NAME = "enigma_cracker_gpu" if sys.platform != "win32" else "enigma_cracker_gpu.exe"
 
 # In a PyInstaller bundle the C binary lives next to the GUI in _MEIPASS.
 # In development mode it lives in the script directory (same as before).
 BUNDLED_BINARY = os.path.join(BUNDLE_DIR, BINARY_NAME)
+BUNDLED_GPU_BINARY = os.path.join(BUNDLE_DIR, GPU_BINARY_NAME)
 BINARY_PATH = BUNDLED_BINARY
+GPU_BINARY_PATH = BUNDLED_GPU_BINARY
 
 
 # ─── Compiler detection ───
@@ -64,8 +69,11 @@ def find_compiler():
     return None
 
 
-def compile_binary():
-    """Compile the C binary. Returns (success, message)."""
+def compile_binary(backend="cpu"):
+    """Compile the C binary. Returns (success, message).
+
+    backend: "cpu" for enigma_cracker.c, "gpu" for enigma_cracker_gpu.c
+    """
     cc = find_compiler()
     if not cc:
         return False, (
@@ -75,14 +83,23 @@ def compile_binary():
             "  or MSYS2 with `pacman -S mingw-w64-x86_64-gcc`"
         )
 
-    if not os.path.exists(C_SOURCE):
-        return False, f"C source file not found:\n{C_SOURCE}"
+    if backend == "gpu":
+        source = GPU_SOURCE
+        output_path = GPU_BINARY_PATH
+        if not os.path.exists(source):
+            return False, f"GPU source file not found:\n{source}"
+        cmd = [cc, "-O3", "-fopenmp", "-o", output_path, source, "-lm", "-lOpenCL"]
+    else:
+        source = C_SOURCE
+        output_path = BINARY_PATH
+        if not os.path.exists(source):
+            return False, f"C source file not found:\n{source}"
+        cmd = [cc, "-O3", "-fopenmp", "-o", output_path, source, "-lm"]
 
-    cmd = [cc, "-O3", "-fopenmp", "-o", BINARY_PATH, C_SOURCE, "-lm"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
-            return True, f"Compiled successfully with {cc}"
+            return True, f"Compiled {backend} binary successfully with {cc}"
         else:
             return False, f"Compilation failed:\n{r.stderr}"
     except subprocess.TimeoutExpired:
@@ -91,21 +108,20 @@ def compile_binary():
         return False, f"Compilation error: {e}"
 
 
-def ensure_binary():
+def ensure_binary(backend="cpu"):
     """Ensure the C binary exists and is up-to-date. Returns (success, message).
 
-    When running as a PyInstaller bundle, the pre-compiled binary is in
-    _MEIPASS and is used directly — no compiler is needed on the target
-    machine.  In development mode we fall back to compiling from source.
+    backend: "cpu" for the CPU-only binary, "gpu" for the OpenCL GPU binary.
+    The GPU binary automatically falls back to CPU if no OpenCL device is found.
     """
-    # 1. Prefer the bundled (pre-compiled) binary — always present in a
-    #    PyInstaller bundle, may also exist in the script dir in dev mode.
-    if os.path.isfile(BINARY_PATH):
-        return True, "Binary ready (bundled)"
+    path = GPU_BINARY_PATH if backend == "gpu" else BINARY_PATH
 
-    # 2. Development fallback — compile from source if a C compiler is
-    #    available.  This path is not reached in the bundled .exe.
-    return compile_binary()
+    # 1. Prefer the bundled (pre-compiled) binary
+    if os.path.isfile(path):
+        return True, f"{backend.upper()} binary ready (bundled)"
+
+    # 2. Development fallback — compile from source
+    return compile_binary(backend=backend)
 
 
 # ─── Main GUI ───
@@ -161,6 +177,14 @@ class EnigmaCrackerGUI:
         mode_m3.pack(side=tk.LEFT, padx=(0, 10))
         mode_m4 = ttk.Radiobutton(ctrl_frame, text="M4 (Naval, 4-rotor)", variable=self.mode_var, value="M4")
         mode_m4.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Backend selector: CPU vs GPU (OpenCL)
+        ttk.Label(ctrl_frame, text="Backend:").pack(side=tk.LEFT, padx=(0, 4))
+        self.backend_var = tk.StringVar(value="cpu")
+        backend_cpu = ttk.Radiobutton(ctrl_frame, text="CPU (OpenMP)", variable=self.backend_var, value="cpu")
+        backend_cpu.pack(side=tk.LEFT, padx=(0, 10))
+        backend_gpu = ttk.Radiobutton(ctrl_frame, text="GPU (OpenCL)", variable=self.backend_var, value="gpu")
+        backend_gpu.pack(side=tk.LEFT, padx=(0, 20))
 
         self.crack_btn = ttk.Button(ctrl_frame, text="🔓  Crack", command=self.on_crack)
         self.crack_btn.pack(side=tk.LEFT, padx=4)
@@ -252,7 +276,8 @@ class EnigmaCrackerGUI:
 
     def _startup_check(self):
         """Check if binary exists; compile if needed."""
-        ok, msg = ensure_binary()
+        # Check CPU binary first (always needed as fallback)
+        ok, msg = ensure_binary(backend="cpu")
         self.status_label.config(text=msg)
         if not ok:
             messagebox.showwarning("Binary Not Ready", msg)
@@ -300,16 +325,23 @@ class EnigmaCrackerGUI:
     def _crack_thread(self, ct, mode):
         """Run the cracker in a background thread."""
         try:
-            # Ensure binary
-            ok, msg = ensure_binary()
+            backend = self.backend_var.get()
+            ok, msg = ensure_binary(backend=backend)
             if not ok:
                 self.root.after(0, self._crack_error, msg)
                 return
 
-            self.root.after(0, lambda: self.progress_label.config(text="Cracking... (this may take a while)"))
+            # Select the right binary
+            if backend == "gpu":
+                binary = GPU_BINARY_PATH
+            else:
+                binary = BINARY_PATH
+
+            self.root.after(0, lambda: self.progress_label.config(
+                text=f"Cracking with {backend.upper()} backend... (this may take a while)"))
 
             # Build command: use JSON output for reliable parsing
-            cmd = [BINARY_PATH, "--ct", ct, "--mode", mode, "--format", "json"]
+            cmd = [binary, "--ct", ct, "--mode", mode, "--format", "json"]
 
             # Start process
             self.process = subprocess.Popen(
@@ -562,9 +594,10 @@ class EnigmaCrackerGUI:
             messagebox.showerror("Save Error", f"Failed to save:\n{e}")
 
     def on_recompile(self):
-        self.status_label.config(text="Compiling...")
+        backend = self.backend_var.get()
+        self.status_label.config(text=f"Compiling {backend.upper()} binary...")
         self.root.update()
-        ok, msg = compile_binary()
+        ok, msg = compile_binary(backend=backend)
         self.status_label.config(text=msg)
         if ok:
             messagebox.showinfo("Compiled", msg)
@@ -575,28 +608,37 @@ class EnigmaCrackerGUI:
         messagebox.showinfo("About Enigma Cracker",
             "Enigma Cracker GUI\n\n"
             "Brute-force cracker for Enigma M3 (3-rotor) and M4 (4-rotor Naval) machines.\n\n"
-            "Backend: enigma_cracker.c (C)\n"
+            "Backend: enigma_cracker.c (CPU/OpenMP) or enigma_cracker_gpu.c (OpenCL GPU)\n"
             "GUI: Python Tkinter\n\n"
             "Methodology:\n"
-            "  1. Rotor permutation search (Index of Coincidence)\n"
-            "  2. Ring settings search\n"
-            "  3. Plugboard hill climbing (German trigram fitness)\n\n"
-            "Cross-platform: Linux (gcc) and Windows (MinGW)")
+            "  1. Rotor permutation search (Index of Coincidence) — GPU accelerated\n"
+            "  2. Ring settings search (CPU)\n"
+            "  3. Plugboard hill climbing (German trigram fitness) (CPU)\n\n"
+            "Cross-platform: Linux (gcc) and Windows (MinGW)\n"
+            "GPU mode requires OpenCL (AMD/NVIDIA/Intel drivers)")
 
     def on_usage(self):
         messagebox.showinfo("Usage Guide",
             "How to use:\n\n"
             "1. Paste Enigma ciphertext into the input box (A-Z, spaces ignored)\n"
             "2. Select M3 or M4 mode\n"
-            "3. Click 'Crack' — this may take several seconds to minutes\n"
-            "4. Results appear below: settings, plaintext, elapsed time\n"
-            "5. Click 'Save Results' to export to a text file\n\n"
+            "3. Select backend: CPU (OpenMP) or GPU (OpenCL)\n"
+            "4. Click 'Crack' — this may take several seconds to minutes\n"
+            "5. Results appear below: settings, plaintext, elapsed time\n"
+            "6. Click 'Save Results' to export to a text file\n\n"
             "Tips:\n"
             "- M3 is faster (60 rotor permutations vs M4's much larger search space)\n"
             "- M4 cracking can take significantly longer due to the thin rotor\n"
+            "- GPU (OpenCL) mode accelerates Phase 1 (rotor search) significantly\n"
+            "- The GPU binary automatically falls back to CPU if no OpenCL device\n"
             "- Longer ciphertexts produce more reliable results\n"
-            "- The cracker searches rotors I-V for M3, adds beta/gamma for M4\n"
+            "- The cracker searches rotors I-VIII for M3, adds beta/gamma for M4\n"
             "- If no solution is found, try the other mode\n\n"
+            "GPU setup:\n"
+            "  Linux: install opencl-headers + ocl-icd-libopencl1 (apt)\n"
+            "         plus your GPU vendor's driver (AMD: amdgpu-pro, NVIDIA: cuda)\n"
+            "  Windows: AMD Adrenalin or NVIDIA drivers include OpenCL support\n"
+            "  Build: gcc -O3 -fopenmp -o enigma_cracker_gpu enigma_cracker_gpu.c -lm -lOpenCL\n\n"
             "Windows setup:\n"
             "  Bundled .exe: no installation needed — just run it.\n"
             "  From source: install MinGW-w64 (via MSYS2 recommended):\n"

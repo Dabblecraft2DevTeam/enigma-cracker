@@ -9,20 +9,23 @@ A modern brute-force cracker for WWII Enigma M3 and M4 (Naval) cipher machines.
 - **Fitness functions** — Index of Coincidence + German trigram/bigram scoring
 - **Hill climbing** — optimizes plugboard settings for top candidates
 - **OpenMP parallelism** — uses all CPU cores for fast cracking
+- **OpenCL GPU acceleration** — Phase 1 brute-force runs on GPU (AMD/NVIDIA/Intel)
 - **Tkinter GUI** — paste ciphertext, select M3/M4, crack with progress indicator
 - **Cross-platform** — Linux (gcc), Windows (MinGW or standalone .exe)
 
 ## Performance
 
-| Mode | Configs | Single-thread | 24 threads |
-|------|---------|--------------|------------|
-| M3 | 2.1M | ~12s | ~2s |
-| M4 | 109M | ~12 min | ~40s |
+| Mode | Configs | Single-thread | 24 threads | GPU (OpenCL) |
+|------|---------|--------------|------------|-------------|
+| M3 | 2.1M | ~12s | ~2s | <1s |
+| M4 | 109M | ~12 min | ~40s | ~5s |
 
 ## Files
 
-- `enigma_cracker.c` — C implementation of Enigma simulator + brute-force cracker (with OpenMP)
-- `enigma_gui.py` — Tkinter GUI wrapper (auto-compiles the C program)
+- `enigma_cracker.c` — C implementation of Enigma simulator + brute-force cracker (CPU/OpenMP)
+- `enigma_cracker_gpu.c` — GPU-accelerated cracker with OpenCL (Phase 1) + CPU (Phase 2/3)
+- `enigma_kernel.cl` — OpenCL kernel: Enigma M3/M4 simulation + IC scoring
+- `enigma_gui.py` — Tkinter GUI wrapper (auto-compiles the C program, supports CPU/GPU backend)
 - `enigma_cracker.py` — Python prototype (slower, for reference)
 
 ## Usage
