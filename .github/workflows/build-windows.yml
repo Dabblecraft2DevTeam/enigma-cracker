@@ -23,7 +23,14 @@ jobs:
     
     - name: Build standalone EXE
       run: |
-        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-data "german_words.txt;." --add-data "enigma_kernel.cl;." enigma_gui.py
+        # Build CPU binary (always works on Windows)
+        gcc -O3 -fopenmp -o enigma_cracker.exe enigma_cracker.c -lm
+        # Build GPU binary (links against system OpenCL.dll at runtime)
+        # On user's machine with AMD drivers, OpenCL.dll is in System32
+        # MinGW can link directly to the DLL without a .lib file
+        gcc -O3 -fopenmp -o enigma_cracker_gpu.exe enigma_cracker_gpu.c -L"C:\Windows\System32" -lOpenCL || echo "GPU binary build failed, CPU-only mode"
+        # Build PyInstaller bundle with both binaries + kernel + word list
+        pyinstaller --onefile --windowed --name "EnigmaCracker" --add-binary "enigma_cracker.exe;." --add-binary "enigma_cracker_gpu.exe;." --add-data "german_words.txt;." --add-data "enigma_kernel.cl;." enigma_gui.py
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
