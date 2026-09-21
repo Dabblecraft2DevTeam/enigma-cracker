@@ -922,6 +922,7 @@ typedef struct {
     int ref;
     int p0, p1, p2;
     int g0, g1, g2;   /* best ring settings found in Phase 2 */
+    int tg;           /* thin rotor ring (M4 only) */
     int thin;         /* thin rotor index (M4 only) */
     int tp;           /* thin rotor position (M4 only) */
 } Cand;
@@ -1195,7 +1196,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     long long total = 2LL * 26 * 336 * 2 * 26*26*26;
     if (!json_mode) {
         printf("M4 Brute-force: %lld configs (2 thin × 26 thin_pos × 336 rotor perms × 2 ref × 26³ pos)\n", total);
-        printf("Phase 1: Searching rotor permutations and positions (rings=AAA)...\n");
+        printf("Phase 1: Searching rotor permutations and positions (rings=AAAA)...\n");
     }
     fprintf(stderr, "PROGRESS:phase1:0:%lld\n", total);
     fflush(stderr);
@@ -1291,10 +1292,10 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     qsort(cand, ncand, sizeof(Cand), cand_cmp);
 
     /* Phase 2: ring search on ALL candidates */
-    /* Search all 26^3 ring settings for every candidate (thin ring stays at 0). */
+    /* Search all 26^4 ring settings for every candidate (including thin ring) */
     int top_rings = ncand;
     if (!json_mode)
-        printf("Phase 2: Ring search on all %d candidates (26³ = 17,576 rings each)...\n", top_rings);
+        printf("Phase 2: Ring search on all %d candidates (26^4 = 456,976 rings each)...\n", top_rings);
     fprintf(stderr, "PROGRESS:phase2:0:%d\n", top_rings);
     fflush(stderr);
 
@@ -1308,26 +1309,28 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
         char tmp[512];
         m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,0, rf, idplug, ct, n, tmp);
         int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
-        int bg0 = 0, bg1 = 0, bg2 = 0;
+        int bg0 = 0, bg1 = 0, bg2 = 0, btg = 0;
 
-        /* Search all 26^3 ring settings (thin ring tg=0) */
+        /* Search all 26^4 ring settings (including thin ring tg) */
+        for (int tg = 0; tg < 26; tg++)
         for (int g0 = 0; g0 < 26; g0++)
         for (int g1 = 0; g1 < 26; g1++)
         for (int g2 = 0; g2 < 26; g2++) {
-            m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,g0,g1,g2, rf, idplug, ct, n, tmp);
+            m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, tg,g0,g1,g2, rf, idplug, ct, n, tmp);
             int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
             if (fit > best_fit) {
                 best_fit = fit;
-                bg0 = g0; bg1 = g1; bg2 = g2;
+                bg0 = g0; bg1 = g1; bg2 = g2; btg = tg;
             }
         }
 
         /* Update candidate IC to the IC at best rings (for re-sorting) */
-        m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,bg0,bg1,bg2, rf, idplug, ct, n, tmp);
+        m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, btg,bg0,bg1,bg2, rf, idplug, ct, n, tmp);
         cand[c].ic = ic_num(tmp, n);
         cand[c].g0 = bg0;
         cand[c].g1 = bg1;
         cand[c].g2 = bg2;
+        cand[c].tg = btg;
 
         fprintf(stderr, "PROGRESS:phase2:%d:%d\n", c+1, top_rings);
         fflush(stderr);
@@ -1351,7 +1354,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     int best_plug[26];
     char best_text[512];
     int bThin=R_BETA, bR0=0,bR1=0,bR2=0,bRef=0,bP0=0,bP1=0,bP2=0,bTp=0;
-    int bG0=0,bG1=0,bG2=0;
+    int bG0=0,bG1=0,bG2=0,bTg=0;
 
     for (int c = 0; c < top_hc; c++) {
         int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
@@ -1361,25 +1364,26 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
         int tp = cand[c].tp;
         /* Use the best ring settings found in Phase 2 */
         int bg0 = cand[c].g0, bg1 = cand[c].g1, bg2 = cand[c].g2;
+        int btg = cand[c].tg;
 
         int plug[26];
         char out[512];
 
         /* Hill climb with the best ring settings from Phase 2 */
-        int gs = hill_climb_m4(thin, r0,r1,r2, tp,p0,p1,p2, 0,bg0,bg1,bg2, rf, ct, n, plug, out);
+        int gs = hill_climb_m4(thin, r0,r1,r2, tp,p0,p1,p2, btg,bg0,bg1,bg2, rf, ct, n, plug, out);
 
         memcpy(best_plug, plug, sizeof(plug));
         strcpy(best_text, out);
 
         if (!json_mode) {
-            printf("  #%d  Thin %s  Rotors %s,%s,%s  Ref %s  ThinPos %c  Pos %c%c%c  Rings %c%c%c\n",
+            printf("  #%d  Thin %s  Rotors %s,%s,%s  Ref %s  ThinPos %c  Pos %c%c%c  Rings %c%c%c%c\n",
                    c+1,
                    ROTOR_NAME[thin],
                    ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2],
                    REFLECTOR_NAME[rf],
                    tp+'A',
                    p0+'A', p1+'A', p2+'A',
-                   bg0+'A', bg1+'A', bg2+'A');
+                   btg+'A', bg0+'A', bg1+'A', bg2+'A');
             printf("       IC=%.4f  German=%d\n", ic_dbl(out, n), gs);
             printf("       Plug: ");
             for (int i = 0; i < 26; i++)
@@ -1395,7 +1399,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
             bThin = thin;
             bR0=r0; bR1=r1; bR2=r2; bRef=rf;
             bTp=tp; bP0=p0; bP1=p1; bP2=p2;
-            bG0=bg0; bG1=bg1; bG2=bg2;
+            bG0=bg0; bG1=bg1; bG2=bg2; bTg=btg;
         }
     }
 
@@ -1408,7 +1412,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
     result.tp = bTp;
     result.p0 = bP0; result.p1 = bP1; result.p2 = bP2;
     result.g0 = bG0; result.g1 = bG1; result.g2 = bG2;
-    result.tg = 0;
+    result.tg = bTg;
     memcpy(result.plug, best_plug, sizeof(best_plug));
     strncpy(result.text, best_text, sizeof(result.text)-1);
     result.text[sizeof(result.text)-1] = '\0';
@@ -1426,7 +1430,7 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
         printf("Reflector:   %s\n", REFLECTOR_NAME[bRef]);
         printf("Thin Pos:    %c\n", bTp+'A');
         printf("Positions:   %c%c%c\n", bP0+'A', bP1+'A', bP2+'A');
-        printf("Rings:       %c%c%c\n", bG0+'A', bG1+'A', bG2+'A');
+        printf("Rings:       %c%c%c%c\n", bTg+'A', bG0+'A', bG1+'A', bG2+'A');
         printf("Plugboard:   ");
         for (int i = 0; i < 26; i++)
             if (best_plug[i] > i) printf("%c%c ", i+'A', best_plug[i]+'A');
@@ -1454,7 +1458,7 @@ static void print_json_result(const CrackResult *r)
     if (r->is_m4) {
         printf("  \"thin_rotor\": \"%s\",\n", ROTOR_NAME[r->thin]);
         printf("  \"thin_position\": \"%c\",\n", r->tp + 'A');
-        printf("  \"thin_ring\": \"A\",\n");
+        printf("  \"thin_ring\": \"%c\",\n", r->tg + 'A');
     }
 
     printf("  \"rotors\": \"%s, %s, %s\",\n",
@@ -1464,7 +1468,7 @@ static void print_json_result(const CrackResult *r)
            r->p0+'A', r->p1+'A', r->p2+'A');
 
     if (r->is_m4)
-        printf("  \"rings\": \"%c%c%c\",\n", r->g0+'A', r->g1+'A', r->g2+'A');
+        printf("  \"rings\": \"%c%c%c%c\",\n", r->tg+'A', r->g0+'A', r->g1+'A', r->g2+'A');
     else
         printf("  \"rings\": \"%c%c%c\",\n",
                r->g0+'A', r->g1+'A', r->g2+'A');
