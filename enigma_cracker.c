@@ -9,6 +9,7 @@
  *   - German trigram/bigram scoring
  *   - Brute force: all rotor perms × positions × ring settings for M3
  *   - Hill climbing on plugboard for top candidates
+ *   - Indicator-based message key recovery (M3 doubled indicator, M4 derivation)
  *   - U-264 M4 ciphertext decryption (known settings verification)
  *   - Self-test: encrypt a known message, then brute-forces it from ciphertext only
  *   - CLI interface for external callers (GUI, scripts)
@@ -18,6 +19,7 @@
  * Run:    ./enigma_cracker                              # self-test mode
  *         ./enigma_cracker --ct CIPHERTEXT --mode M3     # crack M3
  *         ./enigma_cracker --ct CIPHERTEXT --mode M4     # crack M4
+ *         ./enigma_cracker --ct CIPHERTEXT --mode M3 --indicator ABCDEF
  *         ./enigma_cracker --ct CIPHERTEXT --mode M3 --format json
  *         echo CIPHERTEXT | ./enigma_cracker --stdin --mode M4
  */
@@ -1443,6 +1445,598 @@ static CrackResult brute_force_m4(const char *ct, int n, int json_mode)
 }
 
 /* ────────────────────────────────────────────────────────── */
+/*  Indicator-based message key recovery                      */
+/*                                                            */
+/*  German Enigma procedures transmitted indicator groups as  */
+/*  the first letters of the ciphertext.  These encode the    */
+/*  message key (initial rotor positions for the actual       */
+/*  message).                                                 */
+/*                                                            */
+/*  M3: The 3-letter message key was encrypted TWICE (6       */
+/*      letters total) using the day key's Grundstellung.     */
+/*      Positions 1-3 and 4-6 of the indicator should decrypt */
+/*      to the SAME 3-letter key.  This doubled-indicator     */
+/*      weakness was exploited by Bletchley Park.  We use it  */
+/*      as a filter: if the two halves don't match, the       */
+/*      settings are wrong and we skip immediately.            */
+/*                                                            */
+/*  M4: The indicator is more complex (K-book/bigram system). */
+/*      We use the first 3 indicator letters as a position     */
+/*      hint: for each candidate Grundstellung, decrypt the   */
+/*      indicator to get the message key, then decrypt the    */
+/*      rest of the ciphertext at that message key.           */
+/* ────────────────────────────────────────────────────────── */
+
+/* M3 indicator brute-force.
+ * indicator = first 6 letters of ciphertext (doubled message key)
+ * ct = ciphertext AFTER stripping the indicator
+ * n = length of ct
+ * ind = indicator string (6 letters)
+ * ind_n = length of indicator (should be 6)
+ *
+ * For each rotor perm × reflector × Grundstellung position:
+ *   1. Decrypt the 6 indicator letters through the Enigma at Grundstellung
+ *   2. Check if positions 1-3 == positions 4-6 (doubled indicator check)
+ *   3. If match: use the first 3 letters as the message key
+ *   4. Decrypt the actual ciphertext at the message key
+ *   5. Score with IC + German fitness
+ * The doubled-indicator filter eliminates ~99.6% of wrong settings
+ * immediately (probability of random match = 1/26^3 ≈ 0.006%).
+ */
+static CrackResult brute_force_m3_indicator(
+    const char *ct, int n,
+    const char *ind, int ind_n,
+    int json_mode)
+{
+    CrackResult result;
+    memset(&result, 0, sizeof(result));
+    result.is_m4 = 0;
+
+    int sr[8] = {R_I, R_II, R_III, R_IV, R_V, R_VI, R_VII, R_VIII};
+    int sref[2] = {REF_B, REF_C};
+    int idplug[26]; plug_init(idplug);
+
+    /* We need at least 6 indicator letters for the doubled-key check */
+    if (ind_n < 6) {
+        if (!json_mode)
+            printf("M3 indicator mode requires at least 6 indicator letters (got %d)\n", ind_n);
+        result.german_score = -1;
+        return result;
+    }
+
+    /* Only need 3 indicator letters for the doubled check, but we use 6 */
+    int ind3_n = 3;   /* first half */
+    char ind_first[8];
+    strncpy(ind_first, ind, 3);
+    ind_first[3] = '\0';
+
+    int thresh = (int)(0.035 * (double)n * (n - 1));
+
+    Cand cand[MAX_CAND];
+    int ncand = 0;
+    int min_ic = 0;
+
+    /* Total: 336 perms × 2 reflectors × 26^3 Grundstellung positions */
+    long long total = 336LL * 2 * 26 * 26 * 26;
+    if (!json_mode) {
+        printf("M3 Indicator mode: doubled indicator filter\n");
+        printf("Indicator (6 letters): %c%c%c %c%c%c\n",
+               ind[0], ind[1], ind[2], ind[3], ind[4], ind[5]);
+        printf("Phase 1: %lld configs (336 perms × 2 ref × 26³ Grundstellungen, rings=AAA)\n", total);
+    }
+    fprintf(stderr, "PROGRESS:phase1:0:%lld\n", total);
+    fflush(stderr);
+
+    double t0 = now_sec();
+    long long cnt = 0;
+    long long filtered = 0;
+
+    #pragma omp parallel for collapse(2) schedule(dynamic) reduction(+:cnt,filtered) shared(cand, ncand, min_ic)
+    for (int ai = 0; ai < 8; ai++)
+    for (int aj = 0; aj < 8; aj++) {
+        if (aj == ai) continue;
+        for (int ak = 0; ak < 8; ak++) {
+            if (ak == ai || ak == aj) continue;
+            int r0 = sr[ai], r1 = sr[aj], r2 = sr[ak];
+
+            for (int rf = 0; rf < 2; rf++)
+            for (int g0 = 0; g0 < 26; g0++)     /* Grundstellung positions */
+            for (int g1 = 0; g1 < 26; g1++)
+            for (int g2 = 0; g2 < 26; g2++) {
+                cnt++;
+
+                /* Step 1: Decrypt the 6 indicator letters at this Grundstellung (rings=AAA) */
+                char ind_out[8];
+                m3_encrypt(r0, r1, r2, g0, g1, g2, 0, 0, 0,
+                           sref[rf], idplug, ind, 6, ind_out);
+
+                /* Step 2: Doubled indicator check — first 3 must match second 3 */
+                if (ind_out[0] != ind_out[3] ||
+                    ind_out[1] != ind_out[4] ||
+                    ind_out[2] != ind_out[5])
+                    continue;   /* filter rejects — skip this config */
+
+                filtered++;
+
+                /* Step 3: The message key is the first 3 decrypted letters */
+                int mk0 = ind_out[0] - 'A';
+                int mk1 = ind_out[1] - 'A';
+                int mk2 = ind_out[2] - 'A';
+
+                /* Step 4: Decrypt actual ciphertext at the derived message key */
+                int ic = fast_ic_m3(r0, r1, r2, mk0, mk1, mk2,
+                                    0, 0, 0, sref[rf], idplug, ct, n);
+
+                if (ic > thresh) {
+                    #pragma omp critical(cand_m3_ind)
+                    {
+                    if (ncand < MAX_CAND) {
+                        cand[ncand].ic = ic;
+                        cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
+                        cand[ncand].ref = sref[rf];
+                        cand[ncand].p0 = mk0; cand[ncand].p1 = mk1; cand[ncand].p2 = mk2;
+                        cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
+                        ncand++;
+                        if (ic < min_ic || ncand == 1) min_ic = ic;
+                        if (ncand == MAX_CAND) {
+                            min_ic = INT_MAX;
+                            for (int k = 0; k < ncand; k++)
+                                if (cand[k].ic < min_ic) min_ic = cand[k].ic;
+                        }
+                    } else if (ic > min_ic) {
+                        int mi = 0;
+                        for (int k = 1; k < ncand; k++)
+                            if (cand[k].ic < cand[mi].ic) mi = k;
+                        cand[mi] = cand[ncand-1];
+                        ncand--;
+                        cand[ncand].ic = ic;
+                        cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
+                        cand[ncand].ref = sref[rf];
+                        cand[ncand].p0 = mk0; cand[ncand].p1 = mk1; cand[ncand].p2 = mk2;
+                        cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
+                        ncand++;
+                        min_ic = INT_MAX;
+                        for (int k = 0; k < ncand; k++)
+                            if (cand[k].ic < min_ic) min_ic = cand[k].ic;
+                    }
+                    }
+                }
+            }
+        }
+    }
+
+    double t1 = now_sec();
+    fprintf(stderr, "PROGRESS:phase1:done:%lld\n", total);
+    fflush(stderr);
+
+    if (!json_mode) {
+        printf("  Done: %lld configs in %.2fs (%.0f/s)\n", cnt, t1-t0, cnt/(t1-t0));
+        printf("  Doubled-indicator filter passed: %lld configs (%.2f%%)\n",
+               filtered, cnt > 0 ? 100.0 * filtered / cnt : 0.0);
+        printf("  Candidates above IC threshold: %d\n\n", ncand);
+    }
+
+    if (ncand == 0) {
+        if (!json_mode)
+            printf("  *** No candidates found — indicator may be wrong ***\n");
+        result.elapsed = t1 - t0;
+        result.configs = cnt;
+        result.german_score = -1;
+        return result;
+    }
+
+    qsort(cand, ncand, sizeof(Cand), cand_cmp);
+
+    /* Phase 2: ring search on all candidates */
+    int top_rings = ncand;
+    if (!json_mode)
+        printf("Phase 2: Ring search on all %d candidates (26³ = 17,576 rings each)...\n", top_rings);
+    fprintf(stderr, "PROGRESS:phase2:0:%d\n", top_rings);
+    fflush(stderr);
+
+    for (int c = 0; c < top_rings; c++) {
+        int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
+        int rf = cand[c].ref;
+        int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
+        char tmp[512];
+        m3_encrypt(r0, r1, r2, p0, p1, p2, 0, 0, 0, rf, idplug, ct, n, tmp);
+        int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+        int bg0 = 0, bg1 = 0, bg2 = 0;
+
+        for (int g0 = 0; g0 < 26; g0++)
+        for (int g1 = 0; g1 < 26; g1++)
+        for (int g2 = 0; g2 < 26; g2++) {
+            m3_encrypt(r0, r1, r2, p0, p1, p2, g0, g1, g2, rf, idplug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+            if (fit > best_fit) {
+                best_fit = fit;
+                bg0 = g0; bg1 = g1; bg2 = g2;
+            }
+        }
+        m3_encrypt(r0, r1, r2, p0, p1, p2, bg0, bg1, bg2, rf, idplug, ct, n, tmp);
+        cand[c].ic = ic_num(tmp, n);
+        cand[c].g0 = bg0; cand[c].g1 = bg1; cand[c].g2 = bg2;
+        fprintf(stderr, "PROGRESS:phase2:%d:%d\n", c+1, top_rings);
+        fflush(stderr);
+    }
+
+    qsort(cand, ncand, sizeof(Cand), cand_cmp);
+
+    double t2 = now_sec();
+    if (!json_mode)
+        printf("  Done in %.2fs\n\n", t2-t1);
+
+    /* Phase 3: hill climb plugboard on top 10 */
+    int top_hc = ncand < 10 ? ncand : 10;
+    if (!json_mode)
+        printf("Phase 3: Hill climb plugboard on top %d candidates\n\n", top_hc);
+    fprintf(stderr, "PROGRESS:phase3:0:%d\n", top_hc);
+    fflush(stderr);
+
+    int best_gs = -1;
+    int best_plug[26];
+    char best_text[512];
+    int bR0=0,bR1=0,bR2=0,bRef=0,bP0=0,bP1=0,bP2=0,bG0=0,bG1=0,bG2=0;
+
+    for (int c = 0; c < top_hc; c++) {
+        int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
+        int rf = cand[c].ref;
+        int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
+        int bg0 = cand[c].g0, bg1 = cand[c].g1, bg2 = cand[c].g2;
+
+        int plug[26];
+        char out[512];
+        int gs = hill_climb_m3(r0, r1, r2, p0, p1, p2, bg0, bg1, bg2, rf, ct, n, plug, out);
+
+        memcpy(best_plug, plug, sizeof(plug));
+        strcpy(best_text, out);
+
+        if (!json_mode) {
+            printf("  #%d  Rotors %s,%s,%s  Ref %s  Pos %c%c%c  Rings %c%c%c\n",
+                   c+1, ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2],
+                   REFLECTOR_NAME[rf], p0+'A', p1+'A', p2+'A',
+                   bg0+'A', bg1+'A', bg2+'A');
+            printf("       IC=%.4f  German=%d\n", ic_dbl(out, n), gs);
+            printf("       Text: %s\n\n", best_text);
+        }
+
+        fprintf(stderr, "PROGRESS:phase3:%d:%d\n", c+1, top_hc);
+        fflush(stderr);
+
+        if (gs > best_gs) {
+            best_gs = gs;
+            bR0=r0; bR1=r1; bR2=r2; bRef=rf;
+            bP0=p0; bP1=p1; bP2=p2;
+            bG0=bg0; bG1=bg1; bG2=bg2;
+        }
+    }
+
+    double t3 = now_sec();
+
+    result.r0 = bR0; result.r1 = bR1; result.r2 = bR2;
+    result.ref = bRef;
+    result.p0 = bP0; result.p1 = bP1; result.p2 = bP2;
+    result.g0 = bG0; result.g1 = bG1; result.g2 = bG2;
+    memcpy(result.plug, best_plug, sizeof(best_plug));
+    strncpy(result.text, best_text, sizeof(result.text)-1);
+    result.text[sizeof(result.text)-1] = '\0';
+    result.german_score = best_gs;
+    result.elapsed = t3 - t0;
+    result.configs = cnt;
+
+    if (!json_mode) {
+        printf("════════════════════════════════════════\n");
+        printf("BEST RESULT (M3 indicator mode)\n");
+        printf("════════════════════════════════════════\n");
+        printf("Rotors:      %s, %s, %s (L,M,R)\n",
+               ROTOR_NAME[bR0], ROTOR_NAME[bR1], ROTOR_NAME[bR2]);
+        printf("Reflector:   %s\n", REFLECTOR_NAME[bRef]);
+        printf("Positions:   %c%c%c  (derived message key)\n", bP0+'A', bP1+'A', bP2+'A');
+        printf("Rings:       %c%c%c\n", bG0+'A', bG1+'A', bG2+'A');
+        printf("Plugboard:   ");
+        for (int i = 0; i < 26; i++)
+            if (best_plug[i] > i) printf("%c%c ", i+'A', best_plug[i]+'A');
+        printf("\nPlaintext:   %s\n", best_text);
+        printf("German score: %d\n", best_gs);
+        printf("Total time:  %.2fs\n", t3 - t0);
+    }
+
+    return result;
+}
+
+/* M4 indicator brute-force.
+ * indicator = first 3-8 letters of ciphertext (procedure indicator)
+ * ct = ciphertext AFTER stripping the indicator
+ * n = length of ct
+ * ind = indicator string
+ * ind_n = length of indicator
+ *
+ * For M4, the indicator procedure is complex (K-book/bigram system).
+ * We use a simplified approach: for each rotor perm × reflector ×
+ * Grundstellung position, decrypt the first 3 indicator letters through
+ * the Enigma. The result is the candidate message key. Then decrypt the
+ * actual ciphertext at that message key and score it.
+ *
+ * This doesn't require the doubled indicator check (M4 didn't use that
+ * procedure), but the indicator creates a verifiable relationship between
+ * Grundstellung and message key that improves the fitness signal.
+ */
+static CrackResult brute_force_m4_indicator(
+    const char *ct, int n,
+    const char *ind, int ind_n,
+    int json_mode)
+{
+    CrackResult result;
+    memset(&result, 0, sizeof(result));
+    result.is_m4 = 1;
+
+    int sr[8] = {R_I, R_II, R_III, R_IV, R_V, R_VI, R_VII, R_VIII};
+    int sref[2] = {REF_B_THIN, REF_C_THIN};
+    int thin_rotors[2] = {R_BETA, R_GAMMA};
+    int idplug[26]; plug_init(idplug);
+
+    /* We need at least 3 indicator letters to derive a message key */
+    if (ind_n < 3) {
+        if (!json_mode)
+            printf("M4 indicator mode requires at least 3 indicator letters (got %d)\n", ind_n);
+        result.german_score = -1;
+        return result;
+    }
+
+    /* Use only first 3 indicator letters for message key derivation */
+    int ind_use = 3;
+
+    int thresh = (int)(0.035 * (double)n * (n - 1));
+
+    Cand cand[MAX_CAND];
+    int ncand = 0;
+    int min_ic = 0;
+
+    /* Total: 2 thin × 26 thin_pos × 336 perms × 2 ref × 26³ Grundstellungen */
+    long long total = 2LL * 26 * 336 * 2 * 26 * 26 * 26;
+    if (!json_mode) {
+        printf("M4 Indicator mode: message key derivation from Grundstellung\n");
+        printf("Indicator (first %d letters): %c%c%c\n",
+               ind_n, ind[0], ind[1], ind[2]);
+        printf("Phase 1: %lld configs (2 thin × 26 thin_pos × 336 perms × 2 ref × 26³ Grundstellungen)\n", total);
+    }
+    fprintf(stderr, "PROGRESS:phase1:0:%lld\n", total);
+    fflush(stderr);
+
+    double t0 = now_sec();
+    long long cnt = 0;
+
+    #pragma omp parallel for collapse(2) schedule(dynamic) reduction(+:cnt) shared(cand, ncand, min_ic)
+    for (int thi = 0; thi < 2; thi++)
+    for (int tp = 0; tp < 26; tp++) {
+        for (int ai = 0; ai < 8; ai++)
+        for (int aj = 0; aj < 8; aj++) {
+            if (aj == ai) continue;
+            for (int ak = 0; ak < 8; ak++) {
+                if (ak == ai || ak == aj) continue;
+                int r0 = sr[ai], r1 = sr[aj], r2 = sr[ak];
+
+                for (int rf = 0; rf < 2; rf++)
+                for (int g0 = 0; g0 < 26; g0++)     /* Grundstellung positions */
+                for (int g1 = 0; g1 < 26; g1++)
+                for (int g2 = 0; g2 < 26; g2++) {
+                    cnt++;
+
+                    /* Step 1: Decrypt 3 indicator letters at this Grundstellung */
+                    char ind_out[8];
+                    m4_encrypt(thin_rotors[thi], r0, r1, r2,
+                               tp, g0, g1, g2,
+                               0, 0, 0, 0,
+                               sref[rf], idplug, ind, ind_use, ind_out);
+
+                    /* Step 2: The decrypted 3 letters are the message key */
+                    int mk0 = ind_out[0] - 'A';
+                    int mk1 = ind_out[1] - 'A';
+                    int mk2 = ind_out[2] - 'A';
+
+                    /* Step 3: Decrypt actual ciphertext at the derived message key */
+                    int ic = fast_ic_m4(thin_rotors[thi], r0, r1, r2,
+                                        tp, mk0, mk1, mk2,
+                                        0, 0, 0, 0,
+                                        sref[rf], idplug, ct, n);
+
+                    if (ic > thresh) {
+                        #pragma omp critical(cand_m4_ind)
+                        {
+                        if (ncand < MAX_CAND) {
+                            cand[ncand].ic = ic;
+                            cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
+                            cand[ncand].ref = sref[rf];
+                            cand[ncand].p0 = mk0; cand[ncand].p1 = mk1; cand[ncand].p2 = mk2;
+                            cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
+                            cand[ncand].thin = thin_rotors[thi];
+                            cand[ncand].tp = tp;
+                            ncand++;
+                            if (ic < min_ic || ncand == 1) min_ic = ic;
+                            if (ncand == MAX_CAND) {
+                                min_ic = INT_MAX;
+                                for (int k = 0; k < ncand; k++)
+                                    if (cand[k].ic < min_ic) min_ic = cand[k].ic;
+                            }
+                        } else if (ic > min_ic) {
+                            int mi = 0;
+                            for (int k = 1; k < ncand; k++)
+                                if (cand[k].ic < cand[mi].ic) mi = k;
+                            cand[mi] = cand[ncand-1];
+                            ncand--;
+                            cand[ncand].ic = ic;
+                            cand[ncand].r0 = r0; cand[ncand].r1 = r1; cand[ncand].r2 = r2;
+                            cand[ncand].ref = sref[rf];
+                            cand[ncand].p0 = mk0; cand[ncand].p1 = mk1; cand[ncand].p2 = mk2;
+                            cand[ncand].g0 = 0; cand[ncand].g1 = 0; cand[ncand].g2 = 0;
+                            cand[ncand].thin = thin_rotors[thi];
+                            cand[ncand].tp = tp;
+                            ncand++;
+                            min_ic = INT_MAX;
+                            for (int k = 0; k < ncand; k++)
+                                if (cand[k].ic < min_ic) min_ic = cand[k].ic;
+                        }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    double t1 = now_sec();
+    fprintf(stderr, "PROGRESS:phase1:done:%lld\n", total);
+    fflush(stderr);
+
+    if (!json_mode) {
+        printf("  Done: %lld configs in %.2fs (%.0f/s)\n", cnt, t1-t0, cnt/(t1-t0));
+        printf("  Candidates above IC threshold: %d\n\n", ncand);
+    }
+
+    if (ncand == 0) {
+        if (!json_mode)
+            printf("  *** No candidates found — indicator may be wrong ***\n");
+        result.elapsed = t1 - t0;
+        result.configs = cnt;
+        result.german_score = -1;
+        return result;
+    }
+
+    qsort(cand, ncand, sizeof(Cand), cand_cmp);
+
+    /* Phase 2: ring search on all candidates (26^4 including thin ring) */
+    int top_rings = ncand;
+    if (!json_mode)
+        printf("Phase 2: Ring search on all %d candidates (26^4 = 456,976 rings each)...\n", top_rings);
+    fprintf(stderr, "PROGRESS:phase2:0:%d\n", top_rings);
+    fflush(stderr);
+
+    for (int c = 0; c < top_rings; c++) {
+        int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
+        int rf = cand[c].ref;
+        int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
+        int thin = cand[c].thin;
+        int tp = cand[c].tp;
+        char tmp[512];
+        m4_encrypt(thin, r0, r1, r2, tp, p0, p1, p2, 0, 0, 0, 0, rf, idplug, ct, n, tmp);
+        int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+        int bg0 = 0, bg1 = 0, bg2 = 0, btg = 0;
+
+        for (int tg = 0; tg < 26; tg++)
+        for (int g0 = 0; g0 < 26; g0++)
+        for (int g1 = 0; g1 < 26; g1++)
+        for (int g2 = 0; g2 < 26; g2++) {
+            m4_encrypt(thin, r0, r1, r2, tp, p0, p1, p2, tg, g0, g1, g2, rf, idplug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+            if (fit > best_fit) {
+                best_fit = fit;
+                bg0 = g0; bg1 = g1; bg2 = g2; btg = tg;
+            }
+        }
+        m4_encrypt(thin, r0, r1, r2, tp, p0, p1, p2, btg, bg0, bg1, bg2, rf, idplug, ct, n, tmp);
+        cand[c].ic = ic_num(tmp, n);
+        cand[c].g0 = bg0; cand[c].g1 = bg1; cand[c].g2 = bg2;
+        cand[c].tg = btg;
+        fprintf(stderr, "PROGRESS:phase2:%d:%d\n", c+1, top_rings);
+        fflush(stderr);
+    }
+
+    qsort(cand, ncand, sizeof(Cand), cand_cmp);
+
+    double t2 = now_sec();
+    if (!json_mode)
+        printf("  Done in %.2fs\n\n", t2-t1);
+
+    /* Phase 3: hill climb plugboard on top 10 */
+    int top_hc = ncand < 10 ? ncand : 10;
+    if (!json_mode)
+        printf("Phase 3: Hill climb plugboard on top %d candidates\n\n", top_hc);
+    fprintf(stderr, "PROGRESS:phase3:0:%d\n", top_hc);
+    fflush(stderr);
+
+    int best_gs = -1;
+    int best_plug[26];
+    char best_text[512];
+    int bThin=R_BETA, bR0=0,bR1=0,bR2=0,bRef=0,bP0=0,bP1=0,bP2=0,bTp=0;
+    int bG0=0,bG1=0,bG2=0,bTg=0;
+
+    for (int c = 0; c < top_hc; c++) {
+        int r0 = cand[c].r0, r1 = cand[c].r1, r2 = cand[c].r2;
+        int rf = cand[c].ref;
+        int p0 = cand[c].p0, p1 = cand[c].p1, p2 = cand[c].p2;
+        int thin = cand[c].thin;
+        int tp = cand[c].tp;
+        int bg0 = cand[c].g0, bg1 = cand[c].g1, bg2 = cand[c].g2;
+        int btg = cand[c].tg;
+
+        int plug[26];
+        char out[512];
+        int gs = hill_climb_m4(thin, r0, r1, r2, tp, p0, p1, p2, btg, bg0, bg1, bg2, rf, ct, n, plug, out);
+
+        memcpy(best_plug, plug, sizeof(plug));
+        strcpy(best_text, out);
+
+        if (!json_mode) {
+            printf("  #%d  Thin %s  Rotors %s,%s,%s  Ref %s  ThinPos %c  Pos %c%c%c  Rings %c%c%c%c\n",
+                   c+1, ROTOR_NAME[thin],
+                   ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2],
+                   REFLECTOR_NAME[rf], tp+'A',
+                   p0+'A', p1+'A', p2+'A',
+                   btg+'A', bg0+'A', bg1+'A', bg2+'A');
+            printf("       IC=%.4f  German=%d\n", ic_dbl(out, n), gs);
+            printf("       Text: %s\n\n", best_text);
+        }
+
+        fprintf(stderr, "PROGRESS:phase3:%d:%d\n", c+1, top_hc);
+        fflush(stderr);
+
+        if (gs > best_gs) {
+            best_gs = gs;
+            bThin = thin;
+            bR0=r0; bR1=r1; bR2=r2; bRef=rf;
+            bTp=tp; bP0=p0; bP1=p1; bP2=p2;
+            bG0=bg0; bG1=bg1; bG2=bg2; bTg=btg;
+        }
+    }
+
+    double t3 = now_sec();
+
+    result.thin = bThin;
+    result.r0 = bR0; result.r1 = bR1; result.r2 = bR2;
+    result.ref = bRef;
+    result.tp = bTp;
+    result.p0 = bP0; result.p1 = bP1; result.p2 = bP2;
+    result.g0 = bG0; result.g1 = bG1; result.g2 = bG2;
+    result.tg = bTg;
+    memcpy(result.plug, best_plug, sizeof(best_plug));
+    strncpy(result.text, best_text, sizeof(result.text)-1);
+    result.text[sizeof(result.text)-1] = '\0';
+    result.german_score = best_gs;
+    result.elapsed = t3 - t0;
+    result.configs = cnt;
+
+    if (!json_mode) {
+        printf("════════════════════════════════════════\n");
+        printf("BEST RESULT (M4 indicator mode)\n");
+        printf("════════════════════════════════════════\n");
+        printf("Thin rotor:  %s\n", ROTOR_NAME[bThin]);
+        printf("Rotors:      %s, %s, %s (L,M,R)\n",
+               ROTOR_NAME[bR0], ROTOR_NAME[bR1], ROTOR_NAME[bR2]);
+        printf("Reflector:   %s\n", REFLECTOR_NAME[bRef]);
+        printf("Thin Pos:    %c\n", bTp+'A');
+        printf("Positions:   %c%c%c  (derived message key)\n", bP0+'A', bP1+'A', bP2+'A');
+        printf("Rings:       %c%c%c%c\n", bTg+'A', bG0+'A', bG1+'A', bG2+'A');
+        printf("Plugboard:   ");
+        for (int i = 0; i < 26; i++)
+            if (best_plug[i] > i) printf("%c%c ", i+'A', best_plug[i]+'A');
+        printf("\nPlaintext:   %s\n", best_text);
+        printf("German score: %d\n", best_gs);
+        printf("Total time:  %.2fs\n", t3 - t0);
+    }
+
+    return result;
+}
+
+/* ────────────────────────────────────────────────────────── */
 /*  JSON output                                               */
 /* ────────────────────────────────────────────────────────── */
 
@@ -1515,6 +2109,10 @@ static void print_usage(const char *prog)
         "  --ct <TEXT>        Ciphertext to crack (uppercase A-Z only)\n"
         "  --stdin            Read ciphertext from stdin\n"
         "  --mode M3|M4       Enigma model (default: M3)\n"
+        "  --indicator <TXT>  Indicator groups (first 6-8 letters of ciphertext)\n"
+        "                     M3: 6-letter doubled indicator (message key sent twice)\n"
+        "                     M4: 3-8 letter indicator for message key derivation\n"
+        "                     The indicator is stripped from ciphertext before cracking\n"
         "  --format text|json Output format (default: text)\n"
         "  --help             Show this help\n"
         "\n"
@@ -1522,8 +2120,9 @@ static void print_usage(const char *prog)
         "\n"
         "Examples:\n"
         "  %s --ct NCZWVUSXPNYMINHZXMQXSFWXWLKJAHSHNMCOCCAKUQPMKCSMHKSEINJUSBLK --mode M4\n"
+        "  %s --ct CIPHERTEXT --mode M3 --indicator ABCDEF\n"
         "  echo NCZWVUSXPNYMINHZXMQXSFWXWLKJAHSHNMCOCCAKUQPMKCSMHKSEINJUSBLK | %s --stdin --mode M4 --format json\n",
-        prog, prog, prog);
+        prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[])
@@ -1536,6 +2135,7 @@ int main(int argc, char *argv[])
     int use_stdin = 0;
     const char *mode_str = "M3";
     const char *format_str = "text";
+    const char *indicator_arg = NULL;
     int json_mode = 0;
     int is_m4 = 0;
 
@@ -1546,6 +2146,8 @@ int main(int argc, char *argv[])
             use_stdin = 1;
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             mode_str = argv[++i];
+        } else if (strcmp(argv[i], "--indicator") == 0 && i + 1 < argc) {
+            indicator_arg = argv[++i];
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
             format_str = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -1596,6 +2198,37 @@ int main(int argc, char *argv[])
     } else {
         /* No ciphertext provided → self-test mode */
         ct_n = -1;  /* sentinel */
+    }
+
+    /* Parse indicator (if provided) */
+    char indicator[32];
+    int ind_n = 0;
+    if (indicator_arg) {
+        ind_n = sanitize_ct(indicator_arg, indicator, sizeof(indicator));
+        if (ind_n == 0) {
+            fprintf(stderr, "Error: indicator is empty after sanitizing\n");
+            return 1;
+        }
+        if (is_m4 && ind_n < 3) {
+            fprintf(stderr, "Error: M4 indicator needs at least 3 letters (got %d)\n", ind_n);
+            return 1;
+        }
+        if (!is_m4 && ind_n < 6) {
+            fprintf(stderr, "Error: M3 indicator needs at least 6 letters (got %d)\n", ind_n);
+            return 1;
+        }
+    }
+
+    /* If indicator is provided, strip it from the ciphertext */
+    if (ind_n > 0 && ind_n <= ct_n) {
+        if (!json_mode) {
+            printf("Stripping %d indicator letters from ciphertext\n", ind_n);
+            printf("Indicator: %.*s\n", ind_n, indicator);
+            printf("Remaining ciphertext: %d chars\n\n", ct_n - ind_n);
+        }
+        memmove(ct, ct + ind_n, ct_n - ind_n);
+        ct_n -= ind_n;
+        ct[ct_n] = '\0';
     }
 
     /* Self-test mode (no --ct or --stdin) */
@@ -1703,7 +2336,14 @@ int main(int argc, char *argv[])
     }
 
     CrackResult r;
-    if (is_m4) {
+    if (ind_n > 0) {
+        /* Indicator mode: use indicator-based message key recovery */
+        if (is_m4) {
+            r = brute_force_m4_indicator(ct, ct_n, indicator, ind_n, json_mode);
+        } else {
+            r = brute_force_m3_indicator(ct, ct_n, indicator, ind_n, json_mode);
+        }
+    } else if (is_m4) {
         r = brute_force_m4(ct, ct_n, json_mode);
     } else {
         r = brute_force_m3(ct, ct_n, json_mode);

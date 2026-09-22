@@ -192,6 +192,18 @@ class EnigmaCrackerGUI:
         self.clear_btn = ttk.Button(ctrl_frame, text="Clear", command=self.on_clear)
         self.clear_btn.pack(side=tk.LEFT, padx=4)
 
+        # Indicator input row (optional)
+        ind_frame = ttk.Frame(input_frame)
+        ind_frame.pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Label(ind_frame, text="Indicator (optional):").pack(side=tk.LEFT, padx=(0, 4))
+        self.indicator_var = tk.StringVar()
+        self.indicator_entry = ttk.Entry(ind_frame, textvariable=self.indicator_var, width=20,
+                                          font=("Courier", 11))
+        self.indicator_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(ind_frame, text="M3: 6 letters (doubled key)  |  M4: 3-8 letters",
+                  font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT)
+
         # ─── Progress frame ───
         self.progress_frame = ttk.Frame(self.root)
         self.progress_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
@@ -342,6 +354,13 @@ class EnigmaCrackerGUI:
 
             # Build command: use JSON output for reliable parsing
             cmd = [binary, "--ct", ct, "--mode", mode, "--format", "json"]
+
+            # Pass indicator if provided
+            indicator_raw = self.indicator_var.get().strip()
+            if indicator_raw:
+                indicator = ''.join(c for c in indicator_raw.upper() if 'A' <= c <= 'Z')
+                if indicator:
+                    cmd += ["--indicator", indicator]
 
             # For the GPU backend, pass the kernel file path so the binary
             # can find enigma_kernel.cl when bundled with PyInstaller.
@@ -532,6 +551,7 @@ class EnigmaCrackerGUI:
 
     def on_clear(self):
         self.ct_text.delete("1.0", tk.END)
+        self.indicator_var.set("")
         self.pt_text.config(state=tk.NORMAL)
         self.pt_text.delete("1.0", tk.END)
         self.pt_text.config(state=tk.DISABLED)
@@ -629,10 +649,14 @@ class EnigmaCrackerGUI:
             "How to use:\n\n"
             "1. Paste Enigma ciphertext into the input box (A-Z, spaces ignored)\n"
             "2. Select M3 or M4 mode\n"
-            "3. Select backend: CPU (OpenMP) or GPU (OpenCL)\n"
-            "4. Click 'Crack' — this may take several seconds to minutes\n"
-            "5. Results appear below: settings, plaintext, elapsed time\n"
-            "6. Click 'Save Results' to export to a text file\n\n"
+            "3. Optionally enter indicator groups (first 6-8 letters of ciphertext)\n"
+            "   - M3: 6-letter doubled indicator (message key sent twice)\n"
+            "   - M4: 3-8 letter indicator for message key derivation\n"
+            "   - The indicator is stripped from ciphertext before cracking\n"
+            "4. Select backend: CPU (OpenMP) or GPU (OpenCL)\n"
+            "5. Click 'Crack' — this may take several seconds to minutes\n"
+            "6. Results appear below: settings, plaintext, elapsed time\n"
+            "7. Click 'Save Results' to export to a text file\n\n"
             "Tips:\n"
             "- M3 is faster (60 rotor permutations vs M4's much larger search space)\n"
             "- M4 cracking can take significantly longer due to the thin rotor\n"

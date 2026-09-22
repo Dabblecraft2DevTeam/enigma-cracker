@@ -75,24 +75,7 @@ static double now_sec(void) {
 static const char *exe_dir(void)
 {
     static char buf[1024];
-#ifdef _WIN32
-    DWORD len = GetModuleFileNameA(NULL, buf, sizeof(buf));
-    if (len == 0 || len >= sizeof(buf)) return NULL;
-#else
-    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len < 0) return NULL;
-    buf[len] = '\0';
-#endif
-    /* Strip the filename, keep only the directory */
-    char *slash = strrchr(buf, '/');
-    char *bslash = strrchr(buf, '\\');
-    char *last = (bslash > slash) ? bslash : slash;
-    if (last) {
-        last[1] = '\0';
-    } else {
-        buf[0] = '\0';
-    }
-    return buf;
+    return "./";
 }
 
 /* ────────────────────────────────────────────────────────── */
@@ -1420,10 +1403,12 @@ static CrackResult crack(const char *ct, int n, int is_m4, int json_mode, int fo
             m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,0,0,0, rf, idplug, ct, n, tmp);
             int best_fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
 
+            /* Search all 26^4 ring settings (g0, g1, g2, g3) */
             for (int g0 = 0; g0 < 26; g0++)
             for (int g1 = 0; g1 < 26; g1++)
-            for (int g2 = 0; g2 < 26; g2++) {
-                m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, 0,g0,g1,g2, rf, idplug, ct, n, tmp);
+            for (int g2 = 0; g2 < 26; g2++)
+            for (int g3 = 0; g3 < 26; g3++) {
+                m4_encrypt(thin, r0,r1,r2, tp,p0,p1,p2, g3,g0,g1,g2, rf, idplug, ct, n, tmp);
                 int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
                 if (fit > best_fit) { best_fit = fit; bg0 = g0; bg1 = g1; bg2 = g2; }
             }

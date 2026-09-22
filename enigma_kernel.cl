@@ -194,7 +194,7 @@ __kernel void enigma_m4_ic(
     int r2 = perms[perm_id * 3 + 2];
 
     /* Enigma M4 simulation + frequency counting */
-    /* Rings = AAA (g0=g1=g2=0, tg=0), plugboard = identity */
+    /* Rings = AAAA (g0=g1=g2=tg=0), plugboard = identity */
     int pos0 = p0, pos1 = p1, pos2 = p2;
     int to = tp;  /* thin offset (tg = 0 in Phase 1) */
     int f[26] = {0};
