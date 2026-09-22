@@ -204,6 +204,18 @@ class EnigmaCrackerGUI:
         ttk.Label(ind_frame, text="M3: 6 letters (doubled key)  |  M4: 3-8 letters",
                   font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT)
 
+        # Crib input row (optional)
+        crib_frame = ttk.Frame(input_frame)
+        crib_frame.pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Label(crib_frame, text="Crib (optional):").pack(side=tk.LEFT, padx=(0, 4))
+        self.crib_var = tk.StringVar()
+        self.crib_entry = ttk.Entry(crib_frame, textvariable=self.crib_var, width=30,
+                                     font=("Courier", 11))
+        self.crib_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(crib_frame, text="Known plaintext prefix (e.g. VONVON, WETTER, EINSZWO)",
+                  font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT)
+
         # Baseline input row (optional)
         bl_frame = ttk.Frame(input_frame)
         bl_frame.pack(fill=tk.X, pady=(4, 0))
@@ -373,6 +385,13 @@ class EnigmaCrackerGUI:
                 indicator = ''.join(c for c in indicator_raw.upper() if 'A' <= c <= 'Z')
                 if indicator:
                     cmd += ["--indicator", indicator]
+
+            # Pass crib if provided
+            crib_raw = self.crib_var.get().strip()
+            if crib_raw:
+                crib = ''.join(c for c in crib_raw.upper() if 'A' <= c <= 'Z')
+                if crib:
+                    cmd += ["--crib", crib]
 
             # Pass baseline if provided
             baseline_raw = self.baseline_var.get().strip()
@@ -569,6 +588,7 @@ class EnigmaCrackerGUI:
     def on_clear(self):
         self.ct_text.delete("1.0", tk.END)
         self.indicator_var.set("")
+        self.crib_var.set("")
         self.baseline_var.set("")
         self.pt_text.config(state=tk.NORMAL)
         self.pt_text.delete("1.0", tk.END)
@@ -673,7 +693,11 @@ class EnigmaCrackerGUI:
             "   - The indicator is stripped from ciphertext before cracking\n"
             "   - Decrypted indicator is scored against ~257 common German operator keys\n"
             "     (names, places, keyboard patterns) to boost known-plaintext attacks\n"
-            "4. Optionally enter baseline settings for incremental search\n"
+            "4. Optionally enter a known plaintext crib (e.g. VONVON, WETTER, EINSZWO)\n"
+            "   - The crib is verified against decrypted text — a hard mathematical constraint\n"
+            "   - The no-map-to-self rule rejects impossible cribs (crib[i] == ct[i])\n"
+            "   - Dramatically narrows the search space when a crib is known\n"
+            "5. Optionally enter baseline settings for incremental search\n"
             "   - Format: rotors:beta,II,IV,I,reflector:B_thin,rings:AAFB,plugboard:CP,DG,...\n"
             "   - Searches +/-2 from baseline (rings, positions, plugboard swaps)\n"
             "   - Exploits the German weakness of small daily setting changes\n"

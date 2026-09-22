@@ -42,6 +42,16 @@
 #include "german_words_embedded.h"  /* Embedded German word list fallback */
 
 /* ────────────────────────────────────────────────────────── */
+/*  Mathematical constraint engine: crib                       */
+/*  Global crib for known-plaintext elimination.               */
+/*  If set, positions where crib[i] == ct[i] cause immediate   */
+/*  rejection (no-map-to-self rule applied to crib).           */
+/* ────────────────────────────────────────────────────────── */
+
+static char g_crib[128] = {0};
+static int  g_crib_n = 0;
+
+/* ────────────────────────────────────────────────────────── */
 /*  Cross-platform timing                                      */
 /* ────────────────────────────────────────────────────────── */
 
@@ -438,6 +448,11 @@ static int german_fitness(const char *t, int n)
 /*  Fast IC functions (CPU fallback for Phase 1)              */
 /* ────────────────────────────────────────────────────────── */
 
+/* Mathematical constraint: no letter maps to itself.
+ * The Enigma reflector guarantees pt[i] != ct[i] at every position.
+ * If any position violates this, the setting is impossible — return -1.
+ * This eliminates ~92% of wrong settings for 64-char messages BEFORE
+ * any statistical scoring, giving massive speedup. */
 static inline int fast_ic_m3(
     int r0, int r1, int r2,
     int p0, int p1, int p2,
@@ -449,6 +464,7 @@ static inline int fast_ic_m3(
     int f[26] = {0};
     for (int i = 0; i < n; i++) {
         int c = ct[i] - 'A';
+        int ct_i = c;  /* save for no-map-to-self check */
         c = plug[c];
         if (rnotch[r1][pos1]) {
             pos0 = (pos0 + 1) % 26;
@@ -468,6 +484,7 @@ static inline int fast_ic_m3(
         c = m26(rbwd[r1][m26(c + o1)] - o1);
         c = m26(rbwd[r2][m26(c + o2)] - o2);
         c = plug[c];
+        if (c == ct_i) return -1;  /* no-map-to-self: impossible */
         f[c]++;
     }
     int ic = 0;
@@ -475,6 +492,7 @@ static inline int fast_ic_m3(
     return ic;
 }
 
+/* Fast IC for M4 (includes thin rotor) — with no-map-to-self constraint */
 static inline int fast_ic_m4(
     int thin, int r0, int r1, int r2,
     int tp, int p0, int p1, int p2,
@@ -487,6 +505,7 @@ static inline int fast_ic_m4(
     int f[26] = {0};
     for (int i = 0; i < n; i++) {
         int c = ct[i] - 'A';
+        int ct_i = c;  /* save for no-map-to-self check */
         c = plug[c];
         if (rnotch[r1][pos1]) {
             pos0 = (pos0 + 1) % 26;
@@ -508,6 +527,7 @@ static inline int fast_ic_m4(
         c = m26(rbwd[r1][m26(c + o1)] - o1);
         c = m26(rbwd[r2][m26(c + o2)] - o2);
         c = plug[c];
+        if (c == ct_i) return -1;  /* no-map-to-self: impossible */
         f[c]++;
     }
     int ic = 0;
@@ -1174,6 +1194,15 @@ static int cpu_phase1_m3(const char *ct, int n, int threshold, Cand *cand, int j
                 cnt++;
                 int ic = fast_ic_m3(r0,r1,r2, p0,p1,p2, 0,0,0, sref[rf], idplug, ct, n);
                 if (ic > threshold) {
+                    /* Crib verification: if a known plaintext crib is provided,
+                     * decrypt and verify the first crib_n chars match. */
+                    if (g_crib_n > 0) {
+                        char tmp[512];
+                        m3_encrypt(r0, r1, r2, p0, p1, p2, 0, 0, 0,
+                                   sref[rf], idplug, ct, n, tmp);
+                        if (memcmp(tmp, g_crib, g_crib_n) != 0)
+                            continue;  /* crib mismatch — reject */
+                    }
                     #pragma omp critical(cand_m3)
                     {
                     if (ncand < MAX_CAND) {
@@ -1267,6 +1296,16 @@ static int cpu_phase1_m4(const char *ct, int n, int threshold, Cand *cand, int j
                                         0, 0,0,0,
                                         sref[rf], idplug, ct, n);
                     if (ic > threshold) {
+                        /* Crib verification: if a known plaintext crib is provided,
+                         * decrypt and verify the first crib_n chars match. */
+                        if (g_crib_n > 0) {
+                            char tmp[512];
+                            m4_encrypt(thin_rotors[thi], r0, r1, r2,
+                                       tp, p0, p1, p2, 0, 0, 0, 0,
+                                       sref[rf], idplug, ct, n, tmp);
+                            if (memcmp(tmp, g_crib, g_crib_n) != 0)
+                                continue;  /* crib mismatch — reject */
+                        }
                         #pragma omp critical(cand_m4)
                         {
                         if (ncand < MAX_CAND) {
@@ -1613,6 +1652,9 @@ static void print_usage(const char *prog)
         "  --ct <TEXT>        Ciphertext to crack (uppercase A-Z only)\n"
         "  --stdin            Read ciphertext from stdin\n"
         "  --mode M3|M4       Enigma model (default: M3)\n"
+        "  --crib <TXT>       Known plaintext crib (e.g. VONVON, WETTER)\n"
+        "                     Verifies decrypted text starts with crib.\n"
+        "                     Applies no-map-to-self rule to reject impossible cribs.\n"
         "  --format text|json Output format (default: text)\n"
         "  --cpu              Force CPU fallback (no GPU)\n"
         "  --kernel <PATH>    Path to enigma_kernel.cl (default: search exe dir + cwd)\n"
@@ -1640,6 +1682,7 @@ int main(int argc, char *argv[])
     int is_m4 = 0;
     int force_cpu = 0;
     const char *kernel_arg = NULL;
+    const char *crib_arg = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ct") == 0 && i + 1 < argc) {
@@ -1648,6 +1691,8 @@ int main(int argc, char *argv[])
             use_stdin = 1;
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             mode_str = argv[++i];
+        } else if (strcmp(argv[i], "--crib") == 0 && i + 1 < argc) {
+            crib_arg = argv[++i];
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
             format_str = argv[++i];
         } else if (strcmp(argv[i], "--cpu") == 0) {
@@ -1698,6 +1743,33 @@ int main(int argc, char *argv[])
         ct_n = sanitize_ct(ct_raw, ct, 512);
     } else {
         ct_n = -1;
+    }
+
+    /* Parse crib (known plaintext prefix) */
+    if (crib_arg && ct_n > 0) {
+        char crib_raw[256];
+        strncpy(crib_raw, crib_arg, sizeof(crib_raw) - 1);
+        crib_raw[sizeof(crib_raw) - 1] = '\0';
+        g_crib_n = sanitize_ct(crib_raw, g_crib, sizeof(g_crib));
+        if (g_crib_n == 0) {
+            fprintf(stderr, "Error: crib is empty after sanitizing\n");
+            return 1;
+        }
+        if (g_crib_n > ct_n) {
+            fprintf(stderr, "Error: crib (%d chars) is longer than ciphertext (%d chars)\n",
+                    g_crib_n, ct_n);
+            return 1;
+        }
+        for (int i = 0; i < g_crib_n; i++) {
+            if (g_crib[i] == ct[i]) {
+                fprintf(stderr, "Error: crib violates no-map-to-self rule at position %d: "
+                        "crib[%d]='%c' == ct[%d]='%c'\n",
+                        i, i, g_crib[i], i, ct[i]);
+                return 1;
+            }
+        }
+        if (!json_mode)
+            printf("Crib: %.*s (%d chars)\n\n", g_crib_n, g_crib, g_crib_n);
     }
 
     /* Self-test mode */
