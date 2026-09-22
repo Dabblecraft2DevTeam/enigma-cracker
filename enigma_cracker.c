@@ -33,6 +33,7 @@
 #include <omp.h>
 #endif
 #include "german_words_embedded.h"  /* Embedded German word list fallback */
+#include "operator_keys_embedded.h" /* Common German operator message keys */
 
 /* ────────────────────────────────────────────────────────── */
 /*  Cross-platform timing                                      */
@@ -1563,9 +1564,23 @@ static CrackResult brute_force_m3_indicator(
                 int mk1 = ind_out[1] - 'A';
                 int mk2 = ind_out[2] - 'A';
 
+                /* Step 3b: Score decrypted indicator against common operator keys.
+                 * The doubled-indicator check already gives us high confidence,
+                 * but scoring against operator keys provides additional fitness
+                 * signal — operators often used recognizable keys. */
+                char ind_key[4];
+                ind_key[0] = ind_out[0];
+                ind_key[1] = ind_out[1];
+                ind_key[2] = ind_out[2];
+                ind_key[3] = '\0';
+                int op_score = score_operator_key(ind_key, 3);
+
                 /* Step 4: Decrypt actual ciphertext at the derived message key */
                 int ic = fast_ic_m3(r0, r1, r2, mk0, mk1, mk2,
                                     0, 0, 0, sref[rf], idplug, ct, n);
+
+                /* Boost IC score if indicator matches known operator key patterns */
+                ic += op_score * 100;
 
                 if (ic > thresh) {
                     #pragma omp critical(cand_m3_ind)
@@ -1834,11 +1849,24 @@ static CrackResult brute_force_m4_indicator(
                     int mk1 = ind_out[1] - 'A';
                     int mk2 = ind_out[2] - 'A';
 
+                    /* Step 2b: Score decrypted indicator against common operator keys */
+                    char ind_key[4];
+                    ind_key[0] = ind_out[0];
+                    ind_key[1] = ind_out[1];
+                    ind_key[2] = ind_out[2];
+                    ind_key[3] = '\0';
+                    int op_score = score_operator_key(ind_key, 3);
+
                     /* Step 3: Decrypt actual ciphertext at the derived message key */
                     int ic = fast_ic_m4(thin_rotors[thi], r0, r1, r2,
                                         tp, mk0, mk1, mk2,
                                         0, 0, 0, 0,
                                         sref[rf], idplug, ct, n);
+
+                    /* Boost IC score if indicator matches known operator key patterns.
+                     * A strong operator key match (score >= 50) is highly significant
+                     * and should push this candidate above non-matching ones. */
+                    ic += op_score * 100;
 
                     if (ic > thresh) {
                         #pragma omp critical(cand_m4_ind)
@@ -2037,6 +2065,688 @@ static CrackResult brute_force_m4_indicator(
 }
 
 /* ────────────────────────────────────────────────────────── */
+/*  Baseline search mode                                      */
+/*                                                            */
+/*  Exploits the German weakness of making small incremental  */
+/*  changes to daily settings. Instead of searching all       */
+/*  26^4 ring combinations, search ±2 positions from a       */
+/*  known baseline. Also searches rotor positions ±2 and     */
+/*  plugboard by swapping 1-2 pairs from the baseline.       */
+/*                                                            */
+/*  Baseline format:                                          */
+/*    rotors:beta,II,IV,I,reflector:B_thin,rings:AAFB,        */
+/*    plugboard:CP,DG,EJ,FI,KT,LZ,MS                          */
+/* ────────────────────────────────────────────────────────── */
+
+/* Parse a rotor name string into rotor index */
+static int parse_rotor_name(const char *name)
+{
+    for (int i = 0; i < 10; i++) {
+        if (strcmp(ROTOR_NAME[i], name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Parse a reflector name string into reflector index */
+static int parse_reflector_name(const char *name)
+{
+    for (int i = 0; i < 4; i++) {
+        if (strcmp(REFLECTOR_NAME[i], name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Baseline settings structure */
+typedef struct {
+    int thin;           /* thin rotor (M4 only) */
+    int r0, r1, r2;     /* left, middle, right rotors */
+    int ref;            /* reflector */
+    int tg, g0, g1, g2; /* ring settings (thin, left, middle, right) */
+    int tp, p0, p1, p2; /* positions (thin, left, middle, right) */
+    int plug[26];       /* plugboard */
+    int has_positions;  /* whether positions are specified */
+    int is_m4;
+} BaselineSettings;
+
+/* Parse baseline settings string.
+ * Format: rotors:beta,II,IV,I,reflector:B_thin,rings:AAFB,plugboard:CP,DG,...
+ *         positions:VJNA (optional)
+ * Returns 1 on success, 0 on failure.
+ */
+static int parse_baseline(const char *str, BaselineSettings *bs)
+{
+    memset(bs, 0, sizeof(*bs));
+    plug_init(bs->plug);
+    bs->thin = -1;
+    bs->has_positions = 0;
+
+    /* Make a mutable copy */
+    char buf[512];
+    strncpy(buf, str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    /* Split by commas at the top level, but first split by section keywords */
+    char *p = buf;
+    while (*p) {
+        /* Find the section keyword (rotors:, reflector:, rings:, plugboard:, positions:) */
+        char *section = p;
+        char *colon = strchr(p, ':');
+        if (!colon) break;
+        *colon = '\0';
+        char *value = colon + 1;
+
+        /* Find end of value (next section keyword or end of string) */
+        /* Sections are delimited by commas followed by a keyword and colon */
+        char *next = value;
+        /* Find the next section: look for a comma that's followed by a word and colon */
+        char *search = value;
+        while (*search) {
+            char *comma = strchr(search, ',');
+            if (!comma) { next = search + strlen(search); break; }
+            /* Check if what follows the comma looks like "keyword:" */
+            char *after = comma + 1;
+            char *next_colon = strchr(after, ':');
+            if (next_colon) {
+                /* Check that everything between comma and colon is alpha */
+                int is_section = 1;
+                for (char *c = after; c < next_colon; c++) {
+                    if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z'))) {
+                        is_section = 0;
+                        break;
+                    }
+                }
+                if (is_section) {
+                    *comma = '\0';
+                    next = after;
+                    break;
+                }
+            }
+            search = comma + 1;
+        }
+        if (!*next) next = value + strlen(value);
+
+        /* Process the section */
+        if (strcmp(section, "rotors") == 0) {
+            /* Parse comma-separated rotor names: beta,II,IV,I (M4) or I,II,III (M3) */
+            char rotors[4][16];
+            int nrot = 0;
+            char *tok = strtok(value, ",");
+            while (tok && nrot < 4) {
+                strncpy(rotors[nrot], tok, sizeof(rotors[0]) - 1);
+                rotors[nrot][sizeof(rotors[0]) - 1] = '\0';
+                nrot++;
+                tok = strtok(NULL, ",");
+            }
+            if (nrot == 4) {
+                /* M4: thin,left,middle,right */
+                bs->is_m4 = 1;
+                bs->thin = parse_rotor_name(rotors[0]);
+                bs->r0 = parse_rotor_name(rotors[1]);
+                bs->r1 = parse_rotor_name(rotors[2]);
+                bs->r2 = parse_rotor_name(rotors[3]);
+            } else if (nrot == 3) {
+                /* M3: left,middle,right */
+                bs->is_m4 = 0;
+                bs->r0 = parse_rotor_name(rotors[0]);
+                bs->r1 = parse_rotor_name(rotors[1]);
+                bs->r2 = parse_rotor_name(rotors[2]);
+            }
+        } else if (strcmp(section, "reflector") == 0) {
+            bs->ref = parse_reflector_name(value);
+        } else if (strcmp(section, "rings") == 0) {
+            int rlen = (int)strlen(value);
+            if (bs->is_m4 && rlen >= 4) {
+                bs->tg = value[0] - 'A';
+                bs->g0 = value[1] - 'A';
+                bs->g1 = value[2] - 'A';
+                bs->g2 = value[3] - 'A';
+            } else if (rlen >= 3) {
+                bs->g0 = value[0] - 'A';
+                bs->g1 = value[1] - 'A';
+                bs->g2 = value[2] - 'A';
+            }
+        } else if (strcmp(section, "plugboard") == 0) {
+            char *tok = strtok(value, ",");
+            while (tok) {
+                if (strlen(tok) >= 2) {
+                    int a = tok[0] - 'A';
+                    int b = tok[1] - 'A';
+                    if (a >= 0 && a < 26 && b >= 0 && b < 26)
+                        plug_add(bs->plug, a, b);
+                }
+                tok = strtok(NULL, ",");
+            }
+        } else if (strcmp(section, "positions") == 0) {
+            int plen = (int)strlen(value);
+            if (bs->is_m4 && plen >= 4) {
+                bs->tp = value[0] - 'A';
+                bs->p0 = value[1] - 'A';
+                bs->p1 = value[2] - 'A';
+                bs->p2 = value[3] - 'A';
+                bs->has_positions = 1;
+            } else if (plen >= 3) {
+                bs->p0 = value[0] - 'A';
+                bs->p1 = value[1] - 'A';
+                bs->p2 = value[2] - 'A';
+                bs->has_positions = 1;
+            }
+        }
+
+        p = next;
+    }
+
+    /* Validate */
+    if (bs->r0 < 0 || bs->r1 < 0 || bs->r2 < 0 || bs->ref < 0)
+        return 0;
+    if (bs->is_m4 && bs->thin < 0)
+        return 0;
+
+    return 1;
+}
+
+/* Generate ±2 range for a ring/position value (wrapping at 26) */
+static void range_pm2(int center, int *vals, int *count)
+{
+    *count = 0;
+    for (int d = -2; d <= 2; d++) {
+        vals[(*count)++] = ((center + d) % 26 + 26) % 26;
+    }
+}
+
+/* Baseline search for M3 */
+static CrackResult baseline_search_m3(
+    const char *ct, int n,
+    const BaselineSettings *bs,
+    int json_mode)
+{
+    CrackResult result;
+    memset(&result, 0, sizeof(result));
+    result.is_m4 = 0;
+
+    int r0 = bs->r0, r1 = bs->r1, r2 = bs->r2;
+    int ref = bs->ref;
+    int bg0 = bs->g0, bg1 = bs->g1, bg2 = bs->g2;
+
+    /* Generate ±2 ranges for rings */
+    int rg0[5], rg1[5], rg2[5];
+    int ng0, ng1, ng2;
+    range_pm2(bg0, rg0, &ng0);
+    range_pm2(bg1, rg1, &ng1);
+    range_pm2(bg2, rg2, &ng2);
+
+    /* Generate ±2 ranges for positions (if provided, otherwise search all 26) */
+    int rp0[26], rp1[26], rp2[26];
+    int np0, np1, np2;
+    if (bs->has_positions) {
+        range_pm2(bs->p0, rp0, &np0);
+        range_pm2(bs->p1, rp1, &np1);
+        range_pm2(bs->p2, rp2, &np2);
+    } else {
+        np0 = np1 = np2 = 26;
+        for (int i = 0; i < 26; i++) { rp0[i] = i; rp1[i] = i; rp2[i] = i; }
+    }
+
+    long long total = (long long)ng0 * ng1 * ng2 * np0 * np1 * np2;
+    if (!json_mode) {
+        printf("M3 Baseline search mode: ±2 from known settings\n");
+        printf("Baseline rotors: %s,%s,%s  Ref: %s  Rings: %c%c%c\n",
+               ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2],
+               REFLECTOR_NAME[ref], bg0+'A', bg1+'A', bg2+'A');
+        if (bs->has_positions)
+            printf("Baseline positions: %c%c%c\n", bs->p0+'A', bs->p1+'A', bs->p2+'A');
+        printf("Search space: %lld configs (rings ±2 × positions ±2)\n", total);
+    }
+    fprintf(stderr, "PROGRESS:phase1:0:%lld\n", total);
+    fflush(stderr);
+
+    double t0 = now_sec();
+    long long cnt = 0;
+
+    int best_plug[26];
+    memcpy(best_plug, bs->plug, sizeof(best_plug));
+    char best_text[512];
+    int best_fit = -1;
+    int bP0=0, bP1=0, bP2=0, bG0=0, bG1=0, bG2=0;
+
+    /* Phase 1: Search rings ±2 × positions ±2 with baseline plugboard */
+    #pragma omp parallel for collapse(3) schedule(dynamic) reduction(+:cnt) \
+        shared(best_fit, best_plug, best_text, bP0, bP1, bP2, bG0, bG1, bG2)
+    for (int i0 = 0; i0 < ng0; i0++)
+    for (int i1 = 0; i1 < ng1; i1++)
+    for (int i2 = 0; i2 < ng2; i2++) {
+        int g0 = rg0[i0], g1 = rg1[i1], g2 = rg2[i2];
+        for (int j0 = 0; j0 < np0; j0++)
+        for (int j1 = 0; j1 < np1; j1++)
+        for (int j2 = 0; j2 < np2; j2++) {
+            int p0 = rp0[j0], p1 = rp1[j1], p2 = rp2[j2];
+            cnt++;
+
+            char tmp[512];
+            m3_encrypt(r0, r1, r2, p0, p1, p2, g0, g1, g2, ref,
+                       bs->plug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+
+            if (fit > best_fit) {
+                #pragma omp critical(baseline_m3)
+                {
+                if (fit > best_fit) {
+                    best_fit = fit;
+                    bP0 = p0; bP1 = p1; bP2 = p2;
+                    bG0 = g0; bG1 = g1; bG2 = g2;
+                    memcpy(best_plug, bs->plug, sizeof(best_plug));
+                    strncpy(best_text, tmp, sizeof(best_text) - 1);
+                    best_text[sizeof(best_text) - 1] = '\0';
+                }
+                }
+            }
+        }
+    }
+
+    double t1 = now_sec();
+    fprintf(stderr, "PROGRESS:phase1:done:%lld\n", total);
+    fflush(stderr);
+    if (!json_mode)
+        printf("  Phase 1 done: %lld configs in %.2fs\n", cnt, t1 - t0);
+
+    /* Phase 2: Plugboard swap search — try swapping 1-2 pairs from baseline */
+    int base_plug[26];
+    memcpy(base_plug, bs->plug, sizeof(base_plug));
+
+    /* Count baseline pairs */
+    int base_pairs[13][2];
+    int nbase_pairs = 0;
+    for (int i = 0; i < 26; i++) {
+        if (base_plug[i] > i) {
+            base_pairs[nbase_pairs][0] = i;
+            base_pairs[nbase_pairs][1] = base_plug[i];
+            nbase_pairs++;
+        }
+    }
+
+    /* Phase 2a: Try removing each baseline pair */
+    long long p2_count = 0;
+    if (!json_mode)
+        printf("Phase 2: Plugboard swap search (±1-2 pairs from baseline)...\n");
+    fprintf(stderr, "PROGRESS:phase2:0:%d\n", nbase_pairs + 1);
+    fflush(stderr);
+
+    /* Start from best Phase 1 result */
+    int cur_plug[26];
+    memcpy(cur_plug, base_plug, sizeof(cur_plug));
+
+    /* Try the baseline plugboard as-is with best positions/rings */
+    {
+        char tmp[512];
+        m3_encrypt(r0, r1, r2, bP0, bP1, bP2, bG0, bG1, bG2, ref,
+                   base_plug, ct, n, tmp);
+        int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+        if (fit > best_fit) {
+            best_fit = fit;
+            memcpy(best_plug, base_plug, sizeof(best_plug));
+            strncpy(best_text, tmp, sizeof(best_text) - 1);
+            best_text[sizeof(best_text) - 1] = '\0';
+        }
+    }
+
+    /* Try removing each pair */
+    for (int pi = 0; pi < nbase_pairs; pi++) {
+        int trial_plug[26];
+        memcpy(trial_plug, base_plug, sizeof(trial_plug));
+        int a = base_pairs[pi][0], b = base_pairs[pi][1];
+        trial_plug[a] = a;
+        trial_plug[b] = b;
+
+        char tmp[512];
+        m3_encrypt(r0, r1, r2, bP0, bP1, bP2, bG0, bG1, bG2, ref,
+                   trial_plug, ct, n, tmp);
+        int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+        p2_count++;
+        if (fit > best_fit) {
+            best_fit = fit;
+            memcpy(best_plug, trial_plug, sizeof(trial_plug));
+            strncpy(best_text, tmp, sizeof(best_text) - 1);
+            best_text[sizeof(best_text) - 1] = '\0';
+        }
+        fprintf(stderr, "PROGRESS:phase2:%d:%d\n", pi + 1, nbase_pairs + 1);
+        fflush(stderr);
+    }
+
+    /* Try adding new pairs (swapping unused letters) */
+    int used[26] = {0};
+    for (int i = 0; i < 26; i++) {
+        if (base_plug[i] != i) { used[i] = 1; }
+    }
+
+    for (int a = 0; a < 26; a++) {
+        if (used[a]) continue;
+        for (int b = a + 1; b < 26; b++) {
+            if (used[b]) continue;
+            int trial_plug[26];
+            memcpy(trial_plug, best_plug, sizeof(trial_plug));
+            trial_plug[a] = b;
+            trial_plug[b] = a;
+
+            char tmp[512];
+            m3_encrypt(r0, r1, r2, bP0, bP1, bP2, bG0, bG1, bG2, ref,
+                       trial_plug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+            p2_count++;
+            if (fit > best_fit) {
+                best_fit = fit;
+                memcpy(best_plug, trial_plug, sizeof(trial_plug));
+                strncpy(best_text, tmp, sizeof(best_text) - 1);
+                best_text[sizeof(best_text) - 1] = '\0';
+            }
+        }
+    }
+
+    /* Phase 3: Hill climb from best found so far */
+    if (!json_mode)
+        printf("Phase 3: Hill climb plugboard refinement...\n");
+    fprintf(stderr, "PROGRESS:phase3:0:1\n");
+    fflush(stderr);
+
+    int hc_plug[26];
+    char hc_out[512];
+    int gs = hill_climb_m3(r0, r1, r2, bP0, bP1, bP2, bG0, bG1, bG2, ref,
+                           ct, n, hc_plug, hc_out);
+
+    if (gs > best_fit) {
+        best_fit = gs;
+        memcpy(best_plug, hc_plug, sizeof(hc_plug));
+        strncpy(best_text, hc_out, sizeof(best_text) - 1);
+        best_text[sizeof(best_text) - 1] = '\0';
+    }
+
+    double t2 = now_sec();
+    fprintf(stderr, "PROGRESS:phase3:done:1\n");
+    fflush(stderr);
+
+    result.r0 = r0; result.r1 = r1; result.r2 = r2;
+    result.ref = ref;
+    result.p0 = bP0; result.p1 = bP1; result.p2 = bP2;
+    result.g0 = bG0; result.g1 = bG1; result.g2 = bG2;
+    memcpy(result.plug, best_plug, sizeof(best_plug));
+    strncpy(result.text, best_text, sizeof(result.text) - 1);
+    result.text[sizeof(result.text) - 1] = '\0';
+    result.german_score = best_fit;
+    result.elapsed = t2 - t0;
+    result.configs = cnt + p2_count;
+
+    if (!json_mode) {
+        printf("\n════════════════════════════════════════\n");
+        printf("BEST RESULT (M3 baseline search)\n");
+        printf("════════════════════════════════════════\n");
+        printf("Rotors:      %s, %s, %s (L,M,R)\n",
+               ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2]);
+        printf("Reflector:   %s\n", REFLECTOR_NAME[ref]);
+        printf("Positions:   %c%c%c\n", bP0+'A', bP1+'A', bP2+'A');
+        printf("Rings:       %c%c%c\n", bG0+'A', bG1+'A', bG2+'A');
+        printf("Plugboard:   ");
+        for (int i = 0; i < 26; i++)
+            if (best_plug[i] > i) printf("%c%c ", i+'A', best_plug[i]+'A');
+        printf("\nPlaintext:   %s\n", best_text);
+        printf("German score: %d\n", best_fit);
+        printf("Total time:  %.2fs\n", t2 - t0);
+        printf("Configs:     %lld\n", cnt + p2_count);
+    }
+
+    return result;
+}
+
+/* Baseline search for M4 */
+static CrackResult baseline_search_m4(
+    const char *ct, int n,
+    const BaselineSettings *bs,
+    int json_mode)
+{
+    CrackResult result;
+    memset(&result, 0, sizeof(result));
+    result.is_m4 = 1;
+
+    int thin = bs->thin;
+    int r0 = bs->r0, r1 = bs->r1, r2 = bs->r2;
+    int ref = bs->ref;
+    int btg = bs->tg, bg0 = bs->g0, bg1 = bs->g1, bg2 = bs->g2;
+
+    /* Generate ±2 ranges for rings (including thin ring) */
+    int rtg[5], rg0[5], rg1[5], rg2[5];
+    int ntg, ng0, ng1, ng2;
+    range_pm2(btg, rtg, &ntg);
+    range_pm2(bg0, rg0, &ng0);
+    range_pm2(bg1, rg1, &ng1);
+    range_pm2(bg2, rg2, &ng2);
+
+    /* Generate ±2 ranges for positions */
+    int rtp[26], rp0[26], rp1[26], rp2[26];
+    int ntp, np0, np1, np2;
+    if (bs->has_positions) {
+        range_pm2(bs->tp, rtp, &ntp);
+        range_pm2(bs->p0, rp0, &np0);
+        range_pm2(bs->p1, rp1, &np1);
+        range_pm2(bs->p2, rp2, &np2);
+    } else {
+        ntp = 26; for (int i = 0; i < 26; i++) rtp[i] = i;
+        np0 = np1 = np2 = 26;
+        for (int i = 0; i < 26; i++) { rp0[i] = i; rp1[i] = i; rp2[i] = i; }
+    }
+
+    long long total = (long long)ntg * ng0 * ng1 * ng2 * ntp * np0 * np1 * np2;
+    if (!json_mode) {
+        printf("M4 Baseline search mode: ±2 from known settings\n");
+        printf("Baseline thin: %s  Rotors: %s,%s,%s  Ref: %s\n",
+               ROTOR_NAME[thin], ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2],
+               REFLECTOR_NAME[ref]);
+        printf("Baseline rings: %c%c%c%c\n", btg+'A', bg0+'A', bg1+'A', bg2+'A');
+        if (bs->has_positions)
+            printf("Baseline positions: %c%c%c%c\n", bs->tp+'A', bs->p0+'A', bs->p1+'A', bs->p2+'A');
+        printf("Search space: %lld configs (rings ±2 × positions ±2)\n", total);
+    }
+    fprintf(stderr, "PROGRESS:phase1:0:%lld\n", total);
+    fflush(stderr);
+
+    double t0 = now_sec();
+    long long cnt = 0;
+
+    int best_plug[26];
+    memcpy(best_plug, bs->plug, sizeof(best_plug));
+    char best_text[512];
+    int best_fit = -1;
+    int bTp=0, bP0=0, bP1=0, bP2=0;
+    int bTg=0, bG0=0, bG1=0, bG2=0;
+
+    /* Phase 1: Search rings ±2 × positions ±2 with baseline plugboard */
+    #pragma omp parallel for collapse(4) schedule(dynamic) reduction(+:cnt) \
+        shared(best_fit, best_plug, best_text, bTp, bP0, bP1, bP2, bTg, bG0, bG1, bG2)
+    for (int itg = 0; itg < ntg; itg++)
+    for (int i0 = 0; i0 < ng0; i0++)
+    for (int i1 = 0; i1 < ng1; i1++)
+    for (int i2 = 0; i2 < ng2; i2++) {
+        int tg = rtg[itg], g0 = rg0[i0], g1 = rg1[i1], g2 = rg2[i2];
+        for (int jtp = 0; jtp < ntp; jtp++)
+        for (int j0 = 0; j0 < np0; j0++)
+        for (int j1 = 0; j1 < np1; j1++)
+        for (int j2 = 0; j2 < np2; j2++) {
+            int tp = rtp[jtp], p0 = rp0[j0], p1 = rp1[j1], p2 = rp2[j2];
+            cnt++;
+
+            char tmp[512];
+            m4_encrypt(thin, r0, r1, r2, tp, p0, p1, p2,
+                       tg, g0, g1, g2, ref,
+                       bs->plug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+
+            if (fit > best_fit) {
+                #pragma omp critical(baseline_m4)
+                {
+                if (fit > best_fit) {
+                    best_fit = fit;
+                    bTp = tp; bP0 = p0; bP1 = p1; bP2 = p2;
+                    bTg = tg; bG0 = g0; bG1 = g1; bG2 = g2;
+                    memcpy(best_plug, bs->plug, sizeof(best_plug));
+                    strncpy(best_text, tmp, sizeof(best_text) - 1);
+                    best_text[sizeof(best_text) - 1] = '\0';
+                }
+                }
+            }
+        }
+    }
+
+    double t1 = now_sec();
+    fprintf(stderr, "PROGRESS:phase1:done:%lld\n", total);
+    fflush(stderr);
+    if (!json_mode)
+        printf("  Phase 1 done: %lld configs in %.2fs\n", cnt, t1 - t0);
+
+    /* Phase 2: Plugboard swap search */
+    int base_plug[26];
+    memcpy(base_plug, bs->plug, sizeof(base_plug));
+
+    int base_pairs[13][2];
+    int nbase_pairs = 0;
+    for (int i = 0; i < 26; i++) {
+        if (base_plug[i] > i) {
+            base_pairs[nbase_pairs][0] = i;
+            base_pairs[nbase_pairs][1] = base_plug[i];
+            nbase_pairs++;
+        }
+    }
+
+    long long p2_count = 0;
+    if (!json_mode)
+        printf("Phase 2: Plugboard swap search (±1-2 pairs from baseline)...\n");
+    fprintf(stderr, "PROGRESS:phase2:0:%d\n", nbase_pairs + 1);
+    fflush(stderr);
+
+    /* Try baseline plugboard with best positions/rings */
+    {
+        char tmp[512];
+        m4_encrypt(thin, r0, r1, r2, bTp, bP0, bP1, bP2,
+                   bTg, bG0, bG1, bG2, ref,
+                   base_plug, ct, n, tmp);
+        int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+        if (fit > best_fit) {
+            best_fit = fit;
+            memcpy(best_plug, base_plug, sizeof(best_plug));
+            strncpy(best_text, tmp, sizeof(best_text) - 1);
+            best_text[sizeof(best_text) - 1] = '\0';
+        }
+    }
+
+    /* Try removing each baseline pair */
+    for (int pi = 0; pi < nbase_pairs; pi++) {
+        int trial_plug[26];
+        memcpy(trial_plug, base_plug, sizeof(trial_plug));
+        int a = base_pairs[pi][0], b = base_pairs[pi][1];
+        trial_plug[a] = a;
+        trial_plug[b] = b;
+
+        char tmp[512];
+        m4_encrypt(thin, r0, r1, r2, bTp, bP0, bP1, bP2,
+                   bTg, bG0, bG1, bG2, ref,
+                   trial_plug, ct, n, tmp);
+        int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+        p2_count++;
+        if (fit > best_fit) {
+            best_fit = fit;
+            memcpy(best_plug, trial_plug, sizeof(trial_plug));
+            strncpy(best_text, tmp, sizeof(best_text) - 1);
+            best_text[sizeof(best_text) - 1] = '\0';
+        }
+        fprintf(stderr, "PROGRESS:phase2:%d:%d\n", pi + 1, nbase_pairs + 1);
+        fflush(stderr);
+    }
+
+    /* Try adding new pairs */
+    int used[26] = {0};
+    for (int i = 0; i < 26; i++) {
+        if (base_plug[i] != i) used[i] = 1;
+    }
+    for (int a = 0; a < 26; a++) {
+        if (used[a]) continue;
+        for (int b = a + 1; b < 26; b++) {
+            if (used[b]) continue;
+            int trial_plug[26];
+            memcpy(trial_plug, best_plug, sizeof(trial_plug));
+            trial_plug[a] = b;
+            trial_plug[b] = a;
+
+            char tmp[512];
+            m4_encrypt(thin, r0, r1, r2, bTp, bP0, bP1, bP2,
+                       bTg, bG0, bG1, bG2, ref,
+                       trial_plug, ct, n, tmp);
+            int fit = ic_num(tmp, n) * 100 + german_fitness(tmp, n);
+            p2_count++;
+            if (fit > best_fit) {
+                best_fit = fit;
+                memcpy(best_plug, trial_plug, sizeof(trial_plug));
+                strncpy(best_text, tmp, sizeof(best_text) - 1);
+                best_text[sizeof(best_text) - 1] = '\0';
+            }
+        }
+    }
+
+    /* Phase 3: Hill climb from best found */
+    if (!json_mode)
+        printf("Phase 3: Hill climb plugboard refinement...\n");
+    fprintf(stderr, "PROGRESS:phase3:0:1\n");
+    fflush(stderr);
+
+    int hc_plug[26];
+    char hc_out[512];
+    int gs = hill_climb_m4(thin, r0, r1, r2, bTp, bP0, bP1, bP2,
+                           bTg, bG0, bG1, bG2, ref,
+                           ct, n, hc_plug, hc_out);
+
+    if (gs > best_fit) {
+        best_fit = gs;
+        memcpy(best_plug, hc_plug, sizeof(hc_plug));
+        strncpy(best_text, hc_out, sizeof(best_text) - 1);
+        best_text[sizeof(best_text) - 1] = '\0';
+    }
+
+    double t2 = now_sec();
+    fprintf(stderr, "PROGRESS:phase3:done:1\n");
+    fflush(stderr);
+
+    result.thin = thin;
+    result.r0 = r0; result.r1 = r1; result.r2 = r2;
+    result.ref = ref;
+    result.tp = bTp; result.p0 = bP0; result.p1 = bP1; result.p2 = bP2;
+    result.tg = bTg; result.g0 = bG0; result.g1 = bG1; result.g2 = bG2;
+    memcpy(result.plug, best_plug, sizeof(best_plug));
+    strncpy(result.text, best_text, sizeof(result.text) - 1);
+    result.text[sizeof(result.text) - 1] = '\0';
+    result.german_score = best_fit;
+    result.elapsed = t2 - t0;
+    result.configs = cnt + p2_count;
+
+    if (!json_mode) {
+        printf("\n════════════════════════════════════════\n");
+        printf("BEST RESULT (M4 baseline search)\n");
+        printf("════════════════════════════════════════\n");
+        printf("Thin rotor:  %s\n", ROTOR_NAME[thin]);
+        printf("Rotors:      %s, %s, %s (L,M,R)\n",
+               ROTOR_NAME[r0], ROTOR_NAME[r1], ROTOR_NAME[r2]);
+        printf("Reflector:   %s\n", REFLECTOR_NAME[ref]);
+        printf("Thin Pos:    %c\n", bTp+'A');
+        printf("Positions:   %c%c%c\n", bP0+'A', bP1+'A', bP2+'A');
+        printf("Rings:       %c%c%c%c\n", bTg+'A', bG0+'A', bG1+'A', bG2+'A');
+        printf("Plugboard:   ");
+        for (int i = 0; i < 26; i++)
+            if (best_plug[i] > i) printf("%c%c ", i+'A', best_plug[i]+'A');
+        printf("\nPlaintext:   %s\n", best_text);
+        printf("German score: %d\n", best_fit);
+        printf("Total time:  %.2fs\n", t2 - t0);
+        printf("Configs:     %lld\n", cnt + p2_count);
+    }
+
+    return result;
+}
+
+/* ────────────────────────────────────────────────────────── */
 /*  JSON output                                               */
 /* ────────────────────────────────────────────────────────── */
 
@@ -2113,6 +2823,11 @@ static void print_usage(const char *prog)
         "                     M3: 6-letter doubled indicator (message key sent twice)\n"
         "                     M4: 3-8 letter indicator for message key derivation\n"
         "                     The indicator is stripped from ciphertext before cracking\n"
+        "                     Decrypted indicator is scored against common operator keys\n"
+        "  --baseline <TXT>   Baseline settings for incremental search\n"
+        "                     Format: rotors:beta,II,IV,I,reflector:B_thin,\n"
+        "                             rings:AAFB,plugboard:CP,DG,...,positions:VJNA\n"
+        "                     Searches ±2 from baseline (rings, positions, plugboard)\n"
         "  --format text|json Output format (default: text)\n"
         "  --help             Show this help\n"
         "\n"
@@ -2121,8 +2836,9 @@ static void print_usage(const char *prog)
         "Examples:\n"
         "  %s --ct NCZWVUSXPNYMINHZXMQXSFWXWLKJAHSHNMCOCCAKUQPMKCSMHKSEINJUSBLK --mode M4\n"
         "  %s --ct CIPHERTEXT --mode M3 --indicator ABCDEF\n"
+        "  %s --ct CIPHERTEXT --mode M4 --baseline \"rotors:gamma,V,II,VIII,reflector:C_thin,rings:AAFB,plugboard:CP,DG,EJ,FI,KT,LZ,MS\"\n"
         "  echo NCZWVUSXPNYMINHZXMQXSFWXWLKJAHSHNMCOCCAKUQPMKCSMHKSEINJUSBLK | %s --stdin --mode M4 --format json\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[])
@@ -2136,6 +2852,7 @@ int main(int argc, char *argv[])
     const char *mode_str = "M3";
     const char *format_str = "text";
     const char *indicator_arg = NULL;
+    const char *baseline_arg = NULL;
     int json_mode = 0;
     int is_m4 = 0;
 
@@ -2146,6 +2863,8 @@ int main(int argc, char *argv[])
             use_stdin = 1;
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             mode_str = argv[++i];
+        } else if (strcmp(argv[i], "--baseline") == 0 && i + 1 < argc) {
+            baseline_arg = argv[++i];
         } else if (strcmp(argv[i], "--indicator") == 0 && i + 1 < argc) {
             indicator_arg = argv[++i];
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
@@ -2336,7 +3055,30 @@ int main(int argc, char *argv[])
     }
 
     CrackResult r;
-    if (ind_n > 0) {
+    if (baseline_arg) {
+        /* Baseline search mode: parse baseline and search ±2 */
+        BaselineSettings bs;
+        if (!parse_baseline(baseline_arg, &bs)) {
+            fprintf(stderr, "Error: failed to parse baseline settings: %s\n", baseline_arg);
+            if (json_mode) {
+                printf("{\n  \"mode\": \"%s\",\n  \"success\": false,\n  \"error\": \"invalid baseline\"\n}\n", is_m4 ? "M4" : "M3");
+            }
+            return 1;
+        }
+        /* Override is_m4 based on parsed baseline */
+        is_m4 = bs.is_m4;
+        if (!json_mode) {
+            printf("================================================================\n");
+            printf("  ENIGMA CRACKER — %s Baseline Search\n", is_m4 ? "M4" : "M3");
+            printf("================================================================\n\n");
+            printf("Ciphertext (%d chars): %s\n\n", ct_n, ct);
+        }
+        if (is_m4) {
+            r = baseline_search_m4(ct, ct_n, &bs, json_mode);
+        } else {
+            r = baseline_search_m3(ct, ct_n, &bs, json_mode);
+        }
+    } else if (ind_n > 0) {
         /* Indicator mode: use indicator-based message key recovery */
         if (is_m4) {
             r = brute_force_m4_indicator(ct, ct_n, indicator, ind_n, json_mode);

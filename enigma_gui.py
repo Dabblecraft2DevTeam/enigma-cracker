@@ -204,6 +204,18 @@ class EnigmaCrackerGUI:
         ttk.Label(ind_frame, text="M3: 6 letters (doubled key)  |  M4: 3-8 letters",
                   font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT)
 
+        # Baseline input row (optional)
+        bl_frame = ttk.Frame(input_frame)
+        bl_frame.pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Label(bl_frame, text="Baseline (optional):").pack(side=tk.LEFT, padx=(0, 4))
+        self.baseline_var = tk.StringVar()
+        self.baseline_entry = ttk.Entry(bl_frame, textvariable=self.baseline_var, width=60,
+                                         font=("Courier", 10))
+        self.baseline_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(bl_frame, text="rotors:...,reflector:...,rings:...,plugboard:...",
+                  font=("TkDefaultFont", 8), foreground="gray").pack(side=tk.LEFT)
+
         # ─── Progress frame ───
         self.progress_frame = ttk.Frame(self.root)
         self.progress_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
@@ -361,6 +373,11 @@ class EnigmaCrackerGUI:
                 indicator = ''.join(c for c in indicator_raw.upper() if 'A' <= c <= 'Z')
                 if indicator:
                     cmd += ["--indicator", indicator]
+
+            # Pass baseline if provided
+            baseline_raw = self.baseline_var.get().strip()
+            if baseline_raw:
+                cmd += ["--baseline", baseline_raw]
 
             # For the GPU backend, pass the kernel file path so the binary
             # can find enigma_kernel.cl when bundled with PyInstaller.
@@ -552,6 +569,7 @@ class EnigmaCrackerGUI:
     def on_clear(self):
         self.ct_text.delete("1.0", tk.END)
         self.indicator_var.set("")
+        self.baseline_var.set("")
         self.pt_text.config(state=tk.NORMAL)
         self.pt_text.delete("1.0", tk.END)
         self.pt_text.config(state=tk.DISABLED)
@@ -653,10 +671,17 @@ class EnigmaCrackerGUI:
             "   - M3: 6-letter doubled indicator (message key sent twice)\n"
             "   - M4: 3-8 letter indicator for message key derivation\n"
             "   - The indicator is stripped from ciphertext before cracking\n"
-            "4. Select backend: CPU (OpenMP) or GPU (OpenCL)\n"
-            "5. Click 'Crack' — this may take several seconds to minutes\n"
-            "6. Results appear below: settings, plaintext, elapsed time\n"
-            "7. Click 'Save Results' to export to a text file\n\n"
+            "   - Decrypted indicator is scored against ~257 common German operator keys\n"
+            "     (names, places, keyboard patterns) to boost known-plaintext attacks\n"
+            "4. Optionally enter baseline settings for incremental search\n"
+            "   - Format: rotors:beta,II,IV,I,reflector:B_thin,rings:AAFB,plugboard:CP,DG,...\n"
+            "   - Searches +/-2 from baseline (rings, positions, plugboard swaps)\n"
+            "   - Exploits the German weakness of small daily setting changes\n"
+            "   - Reduces search space from billions to thousands\n"
+            "5. Select backend: CPU (OpenMP) or GPU (OpenCL)\n"
+            "6. Click 'Crack' — this may take several seconds to minutes\n"
+            "7. Results appear below: settings, plaintext, elapsed time\n"
+            "8. Click 'Save Results' to export to a text file\n\n"
             "Tips:\n"
             "- M3 is faster (60 rotor permutations vs M4's much larger search space)\n"
             "- M4 cracking can take significantly longer due to the thin rotor\n"
@@ -664,7 +689,8 @@ class EnigmaCrackerGUI:
             "- The GPU binary automatically falls back to CPU if no OpenCL device\n"
             "- Longer ciphertexts produce more reliable results\n"
             "- The cracker searches rotors I-VIII for M3, adds beta/gamma for M4\n"
-            "- If no solution is found, try the other mode\n\n"
+            "- If no solution is found, try the other mode\n"
+            "- Baseline search is much faster than full brute force\n\n"
             "GPU setup:\n"
             "  Linux: install opencl-headers + ocl-icd-libopencl1 (apt)\n"
             "         plus your GPU vendor's driver (AMD: amdgpu-pro, NVIDIA: cuda)\n"
